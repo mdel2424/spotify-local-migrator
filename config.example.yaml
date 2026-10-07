@@ -1,0 +1,35 @@
+# Copy to config.yaml if you want to override the inferred playlist artist.
+playlists:
+  dxrt:
+    expected_artists:
+      - 2sdxrt3all
+  "Westside Gunn":
+    expected_artists:
+      - "Westside Gunn"
+
+auto_threshold: 0.90
+review_threshold: 0.70
+minimum_margin: 0.05
+auto_title_minimum: 0.94
+auto_artist_minimum: 0.95
+
+weights:
+  title: 0.50
+  artist: 0.30
+  duration: 0.15
+  album: 0.05
+
+version_penalty: 0.22
+remaster_penalty: 0.08
+search_pages: 2        # 10 Spotify results per page, per query
+cache_ttl_days: 7
+# market: CA         # Your account country takes priority with user authorization.
+
+# Explicit Prod./p. annotations are learned across a playlist.
+# Add ambiguous credit names here after inspecting scan output.
+producer_names:
+  - resonance
+  - reesy4k
+  - gelatoo
+
+uploader_names: []

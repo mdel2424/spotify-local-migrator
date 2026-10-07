@@ -1,0 +1,77 @@
+{
+  "offset": 0,
+  "total": 7,
+  "next": null,
+  "items": [
+    {
+      "is_local": true,
+      "added_at": null,
+      "added_by": null,
+      "item": {
+        "type": "track",
+        "id": null,
+        "uri": "spotify:local:Westside+Gunn:Supreme+Blientele:Elizabeth:241",
+        "name": "Elizabeth",
+        "artists": [
+          {
+            "name": "Westside Gunn"
+          }
+        ],
+        "album": {
+          "name": "Supreme Blientele"
+        },
+        "duration_ms": 241000
+      }
+    },
+    {
+      "is_local": false,
+      "item": {
+        "type": "track",
+        "id": "BBBBBBBBBBBBBBBBBBBBBB",
+        "uri": "spotify:track:BBBBBBBBBBBBBBBBBBBBBB",
+        "name": "Mr. T"
+      }
+    },
+    {
+      "is_local": false,
+      "item": null
+    },
+    {
+      "is_local": false,
+      "item": {
+        "type": "episode",
+        "uri": "spotify:episode:CCCCCCCCCCCCCCCCCCCCCC",
+        "name": "An episode"
+      }
+    },
+    {
+      "is_local": true,
+      "item": {
+        "type": "track",
+        "uri": "spotify:local:Westside+Gunn:Supreme+Blientele:Elizabeth:241",
+        "name": "Elizabeth",
+        "artists": [
+          {
+            "name": "Westside Gunn"
+          }
+        ],
+        "album": {
+          "name": "Supreme Blientele"
+        },
+        "duration_ms": 241000
+      }
+    },
+    null,
+    {
+      "is_local": true,
+      "item": {
+        "type": "track",
+        "uri": "spotify:local:Bj%C3%B6rk:Album%3A+One:Don%E2%80%99t+Go%2B:123",
+        "name": "",
+        "artists": [],
+        "album": null,
+        "duration_ms": 0
+      }
+    }
+  ]
+}
