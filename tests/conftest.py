@@ -21,6 +21,8 @@ def clear_config_environment(monkeypatch):
         "SPOTIFY_REDIRECT_URI",
         "SPOTIFY_DATA_DIR",
         "SPOTIFY_TOKEN_PATH",
+        "SPOTIFY_REQUEST_INTERVAL_SECONDS",
+        "SPOTIFY_REQUEST_BUDGET_24H",
     ):
         monkeypatch.delenv(key, raising=False)
 
@@ -31,6 +33,7 @@ def settings(tmp_path):
         client_id="test-client",
         token_path=tmp_path / "auth" / "tokens.json",
         data_dir=tmp_path / "data",
+        request_interval_seconds=0,
     )
 
 

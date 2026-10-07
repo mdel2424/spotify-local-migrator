@@ -21,6 +21,8 @@ class Settings(BaseModel):
     max_retries: int = Field(default=3, ge=0, le=10)
     max_retry_wait: float = Field(default=60, gt=0)
     scan_attempts: int = Field(default=3, ge=1, le=10)
+    request_interval_seconds: float = Field(default=3, ge=0, le=60, allow_inf_nan=False)
+    request_budget_24h: int = Field(default=400, ge=1)
 
     @field_validator("client_id", mode="before")
     @classmethod
@@ -62,6 +64,8 @@ def load_settings(env_file: Path = Path(".env")) -> Settings:
         "SPOTIFY_REDIRECT_URI": "redirect_uri",
         "SPOTIFY_DATA_DIR": "data_dir",
         "SPOTIFY_TOKEN_PATH": "token_path",
+        "SPOTIFY_REQUEST_INTERVAL_SECONDS": "request_interval_seconds",
+        "SPOTIFY_REQUEST_BUDGET_24H": "request_budget_24h",
     }
     try:
         values = dict(dotenv_values(env_file)) if env_file.is_file() else {}

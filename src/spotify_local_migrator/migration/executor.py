@@ -13,7 +13,7 @@ from uuid import uuid4
 
 from pydantic import BaseModel, Field, ValidationError
 
-from ..errors import PlaylistChangedError, SpotifyAPIError, StateError
+from ..errors import PlaylistChangedError, RequestBudgetError, SpotifyAPIError, StateError
 from ..matching.search import candidate_from_api
 from ..spotify.client import SpotifyClient
 from ..workflow import account_id
@@ -464,8 +464,10 @@ class MigrationExecutor:
                     plan.playlist_id, [replacement.position + 1], pending.snapshot_before
                 )
         except SpotifyAPIError as exc:
-            if exc.status_code is not None and 400 <= exc.status_code < 500:
-                # An explicit rejection has not committed this request. A
+            if isinstance(exc, RequestBudgetError) or (
+                exc.status_code is not None and 400 <= exc.status_code < 500
+            ):
+                # A local budget pause or explicit rejection has not committed this request. A
                 # transport failure/5xx/malformed successful response remains
                 # uncertain and keeps its durable intent for reconciliation.
                 journal.pending = None

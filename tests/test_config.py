@@ -47,3 +47,32 @@ def test_invalid_env_configuration_does_not_dump_values(tmp_path):
     with pytest.raises(ConfigurationError) as error:
         load_settings(env_file)
     assert "secret@" not in str(error.value)
+
+
+def test_pacing_defaults_and_env_overrides(tmp_path, monkeypatch):
+    assert Settings().request_interval_seconds == 3
+    assert Settings().request_budget_24h == 400
+    env_file = tmp_path / ".env"
+    env_file.write_text("SPOTIFY_REQUEST_INTERVAL_SECONDS=5\nSPOTIFY_REQUEST_BUDGET_24H=200\n")
+    monkeypatch.setenv("SPOTIFY_REQUEST_INTERVAL_SECONDS", "10")
+    settings = load_settings(env_file)
+    assert settings.request_interval_seconds == 10
+    assert settings.request_budget_24h == 200
+
+
+@pytest.mark.parametrize(
+    "key,value",
+    [
+        ("SPOTIFY_REQUEST_INTERVAL_SECONDS", "-1"),
+        ("SPOTIFY_REQUEST_INTERVAL_SECONDS", "NaN"),
+        ("SPOTIFY_REQUEST_INTERVAL_SECONDS", "inf"),
+        ("SPOTIFY_REQUEST_INTERVAL_SECONDS", "61"),
+        ("SPOTIFY_REQUEST_BUDGET_24H", "0"),
+        ("SPOTIFY_REQUEST_BUDGET_24H", "2.5"),
+    ],
+)
+def test_invalid_pacing_configuration_is_rejected(tmp_path, key, value):
+    env_file = tmp_path / ".env"
+    env_file.write_text(f"{key}={value}\n")
+    with pytest.raises(ConfigurationError):
+        load_settings(env_file)

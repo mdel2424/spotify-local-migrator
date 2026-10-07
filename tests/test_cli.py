@@ -115,7 +115,8 @@ def test_local_counts_read_playlists_without_saving(cli_setup):
     assert result.exit_code == 0, result.output
     assert "Westside Gunn" in result.output
     assert len(calls) == 4
-    assert not settings.data_dir.exists()
+    assert CaptureStore(settings.data_dir).originals() == []
+    assert not (settings.data_dir / PLAYLIST_ID).exists()
 
 
 def test_status_does_not_contact_spotify(cli_setup):
@@ -124,6 +125,8 @@ def test_status_does_not_contact_spotify(cli_setup):
     assert result.exit_code == 0, result.output
     assert "SCAN" in result.output or "scan baselines" in result.output
     assert calls == []
+    assert "3s between API attempts" in result.output
+    assert "0/400" in result.output
 
 
 def test_json_requires_explicit_playlist(cli_setup):

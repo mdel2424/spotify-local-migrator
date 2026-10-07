@@ -127,6 +127,40 @@ matching. `review --all` also includes automatic/unmatched decisions.
 search response reuse but never bypasses a cooldown. Verbosity precedes the
 command: `spotify-local-migrate -vv match -p ID`.
 
+## Request pacing and local budget
+
+Every Web API attempt is spaced at least **3 seconds** apart, including search,
+playlist reads/writes, pagination and retries. A persistent local budget permits
+at most **400 attempts per rolling 24 hours**. At the budget limit the command
+stops before sending another request; completed matching decisions, cached query
+pages and migration progress remain resumable. Use `status` to see usage and the
+next budget slot, then `resume` when both the local budget and Spotify cooldown
+allow it. A large migration can span multiple days under this budget.
+
+Settings in `.env` (process environment takes priority):
+
+~~~dotenv
+SPOTIFY_REQUEST_INTERVAL_SECONDS=3
+SPOTIFY_REQUEST_BUDGET_24H=400
+~~~
+
+These are conservative local safeguards, not published Spotify quotas. Spotify
+has a [rolling 30-second rate limit](https://developer.spotify.com/documentation/web-api/concepts/rate-limits)
+and separate [Development Mode quota buckets](https://developer.spotify.com/documentation/web-api/concepts/quota-modes)
+whose numerical thresholds and reset schedule are not published. Pacing alone
+cannot prevent quota exhaustion; the budget limits total volume as well. Neither
+guarantees that Spotify will not return a 429, particularly if other apps on your
+developer account also make requests.
+
+Usage and pacing are shared across jobs, processes and Client IDs using the same
+data directory, persisted in `data/.cache/requests.json`, and protected by a POSIX
+process lock. Restarts do not reset the budget. On upgrade, recent cached search
+responses seed the budget as a lower bound for earlier usage. Requests made by
+other applications or with another data directory cannot be counted locally.
+Cached search hits, `status`, offline review and complete offline dry runs consume
+no budget. Failed attempts still count. Spotify's `Retry-After` cooldown always
+takes precedence.
+
 ## Matching settings
 
 Copy `config.example.yaml` to `config.yaml` for explicit playlist artist hints,

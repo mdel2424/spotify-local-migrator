@@ -9,6 +9,7 @@ from ..errors import AuthenticationError, PlaylistChangedError, RateLimitError, 
 from ..migration.state import validate_playlist_id
 from .auth import SpotifyAuth
 from .http import request_json as transport_request_json
+from .pacing import RequestPacer
 from .rate_limits import CooldownStore
 
 API_ROOT = "https://api.spotify.com/v1"
@@ -24,20 +25,34 @@ class SpotifyClient:
         client: httpx.Client,
         *,
         sleep: Callable[[float], None] = time.sleep,
+        clock: Callable[[], float] = time.time,
     ):
         self.settings = settings
         self.auth = auth
         self.client = client
         self.sleep = sleep
+        self.cooldown = CooldownStore(settings.data_dir, settings.require_client_id(), clock=clock)
+        self.pacer = RequestPacer(
+            settings.data_dir,
+            interval=settings.request_interval_seconds,
+            budget=settings.request_budget_24h,
+            clock=clock,
+            sleep=sleep,
+        )
+
+    def _before_request(self) -> None:
+        self.cooldown.check()
+        self.pacer.before_request()
+        # A different command may have received a 429 while pacing waited.
+        self.cooldown.check()
 
     def _request_json(self, *args: Any, **kwargs: Any) -> tuple[int, dict[str, Any]]:
-        cooldown = CooldownStore(self.settings.data_dir, self.settings.require_client_id())
-        cooldown.check()
+        self.cooldown.check()
         try:
-            return transport_request_json(*args, **kwargs)
+            return transport_request_json(*args, before_request=self._before_request, **kwargs)
         except RateLimitError as exc:
             if exc.retry_after is not None:
-                cooldown.save(exc.retry_after)
+                self.cooldown.save(exc.retry_after)
             raise
 
     def _get(self, endpoint: str, params: dict[str, Any] | None = None) -> dict[str, Any]:

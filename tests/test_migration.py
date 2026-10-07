@@ -6,7 +6,12 @@ import pytest
 from typer.testing import CliRunner
 
 from spotify_local_migrator import cli
-from spotify_local_migrator.errors import PlaylistChangedError, SpotifyAPIError, StateError
+from spotify_local_migrator.errors import (
+    PlaylistChangedError,
+    RequestBudgetError,
+    SpotifyAPIError,
+    StateError,
+)
 from spotify_local_migrator.matching.config import MatchingConfig
 from spotify_local_migrator.matching.engine import new_report
 from spotify_local_migrator.matching.models import MatchDecision
@@ -326,6 +331,29 @@ def test_explicit_rejection_is_retryable_without_duplicate(job, kind, status):
     with pytest.raises(SpotifyAPIError):
         execution.apply(store)
     assert json.loads((store.directory / "migration.json").read_text())["pending"] is None
+    execution.apply(store)
+    assert identities(api.scan(api.original_id)) == plan.desired
+
+
+@pytest.mark.parametrize("kind", ["add", "delete"])
+def test_local_budget_pause_resumes_without_unconfirmed_insertion(job, monkeypatch, kind):
+    store, _, _, plan = job
+    execution, api = executor(job)
+    dispatch = api.add_tracks if kind == "add" else api.remove_positions
+    paused = False
+
+    def pause_once(playlist_id, *args):
+        nonlocal paused
+        if playlist_id == api.original_id and not paused:
+            paused = True
+            raise RequestBudgetError("Local budget reached; request was not dispatched.")
+        return dispatch(playlist_id, *args)
+
+    monkeypatch.setattr(api, "add_tracks" if kind == "add" else "remove_positions", pause_once)
+    with pytest.raises(RequestBudgetError):
+        execution.apply(store)
+    journal = json.loads((store.directory / "migration.json").read_text())
+    assert journal["pending"] is None
     execution.apply(store)
     assert identities(api.scan(api.original_id)) == plan.desired
 

@@ -25,6 +25,10 @@ class RateLimitError(SpotifyAPIError):
         self.retry_after = retry_after
 
 
+class RequestBudgetError(SpotifyAPIError):
+    """Local request budget exhausted before dispatch; Spotify was not contacted."""
+
+
 class PlaylistChangedError(MigratorError):
     pass
 

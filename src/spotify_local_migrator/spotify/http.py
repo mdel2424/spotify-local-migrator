@@ -21,10 +21,13 @@ def request_json(
     max_retry_wait: float = 60,
     sleep: Callable[[float], None] = time.sleep,
     allow_empty: bool = False,
+    before_request: Callable[[], None] | None = None,
     **kwargs: Any,
 ) -> tuple[int, dict[str, Any]]:
     """Bounded retries. Never log request bodies, OAuth data or server error text."""
     for attempt in range(max_retries + 1):
+        if before_request is not None:
+            before_request()
         try:
             response = client.request(method, url, **kwargs)
         except httpx.RequestError as exc:

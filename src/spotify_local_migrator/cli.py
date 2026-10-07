@@ -263,6 +263,22 @@ def status(ctx: typer.Context) -> None:
             table.add_row(Text(original.parent.name), "?", "?", "?", "unreadable")
     console.print(table)
     show_job_status(settings)
+    from .spotify.pacing import RequestPacer
+
+    used, available_at = RequestPacer(
+        settings.data_dir,
+        interval=settings.request_interval_seconds,
+        budget=settings.request_budget_24h,
+    ).usage()
+    console.print(
+        f"Spotify pacing: {settings.request_interval_seconds:g}s between API attempts; "
+        f"local budget {used}/{settings.request_budget_24h} in the last 24 hours."
+    )
+    if available_at is not None:
+        from datetime import datetime
+
+        when = datetime.fromtimestamp(available_at).astimezone().isoformat(timespec="seconds")
+        console.print(Text(f"Next local budget slot: {when}", style="yellow"))
     if settings.client_id:
         from .spotify.rate_limits import CooldownStore
 
