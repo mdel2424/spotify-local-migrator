@@ -126,7 +126,8 @@ def test_status_does_not_contact_spotify(cli_setup):
     assert "SCAN" in result.output or "scan baselines" in result.output
     assert calls == []
     assert "3s between API attempts" in result.output
-    assert "0/400" in result.output
+    assert "no daily cap" in " ".join(result.output.split())
+    assert "wait and continue automatically" in result.output
 
 
 def test_json_requires_explicit_playlist(cli_setup):

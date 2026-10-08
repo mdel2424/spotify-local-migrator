@@ -8,12 +8,12 @@ import json
 from collections.abc import Callable
 from contextlib import contextmanager
 from datetime import UTC, datetime
-from typing import Literal
+from typing import Any, Literal
 from uuid import uuid4
 
 from pydantic import BaseModel, Field, ValidationError
 
-from ..errors import PlaylistChangedError, RequestBudgetError, SpotifyAPIError, StateError
+from ..errors import PlaylistChangedError, RateLimitError, SpotifyAPIError, StateError
 from ..matching.search import candidate_from_api
 from ..spotify.client import SpotifyClient
 from ..workflow import account_id
@@ -150,6 +150,17 @@ class MigrationExecutor:
     def _capture(self, playlist_id: str):
         return self.scanner.scan(playlist_id)
 
+    def _probe_write(self, request: Callable[..., Any], *args: Any) -> Any:
+        # Only the private compatibility-check playlist is handled here. A 429
+        # explicitly rejected the request; uncertain mutations are never retried.
+        while True:
+            try:
+                return request(*args)
+            except RateLimitError:
+                if not self.client.settings.wait_for_rate_limits:
+                    raise
+                self.client.wait_for_cooldown()
+
     def preflight(self, store: JobStore, plan: MigrationPlan) -> None:
         """Prove undocumented positional semantics on catalogue-only duplicates.
 
@@ -184,7 +195,7 @@ class MigrationExecutor:
         failure = None
         try:
             self.progress("Checking positional removal on a temporary private playlist...")
-            created = self.client.create_probe_playlist(probe["name"])
+            created = self._probe_write(self.client.create_probe_playlist, probe["name"])
             playlist_id = created.get("id")
             from .state import validate_playlist_id
 
@@ -196,7 +207,7 @@ class MigrationExecutor:
             probe.update(playlist_id=playlist_id, phase="CREATED")
             store.save("probe.json", probe)
             a, b = uris[:2]
-            before_snapshot = self.client.add_tracks(playlist_id, [a, b, a], 0)
+            before_snapshot = self._probe_write(self.client.add_tracks, playlist_id, [a, b, a], 0)
             before = self._capture(playlist_id)
             if [entry.uri for entry in before.entries] != [
                 a,
@@ -206,12 +217,12 @@ class MigrationExecutor:
                 raise StateError("Temporary playlist insertion could not be verified.")
             probe.update(phase="TESTING", snapshot_before=before_snapshot)
             store.save("probe.json", probe)
-            self.client.remove_positions(playlist_id, [0], before_snapshot)
+            self._probe_write(self.client.remove_positions, playlist_id, [0], before_snapshot)
             first = self._capture(playlist_id)
             if [entry.uri for entry in first.entries] != [b, a]:
                 raise StateError("Spotify did not honor position-only removal.")
             try:
-                self.client.remove_positions(playlist_id, [0], before_snapshot)
+                self._probe_write(self.client.remove_positions, playlist_id, [0], before_snapshot)
             except SpotifyAPIError as exc:
                 if (
                     exc.status_code is None
@@ -228,7 +239,7 @@ class MigrationExecutor:
             # after an insertion shifts its position. Mere retry deduplication
             # is insufficient to protect a local entry from concurrent edits.
             shift_snapshot = second.snapshot_id
-            inserted_snapshot = self.client.add_tracks(playlist_id, [a], 0)
+            inserted_snapshot = self._probe_write(self.client.add_tracks, playlist_id, [a], 0)
             inserted = self._capture(playlist_id)
             if [entry.uri for entry in inserted.entries] != [
                 a,
@@ -238,7 +249,7 @@ class MigrationExecutor:
                 raise StateError("Temporary position-shift insertion could not be verified.")
             stale_rejected = False
             try:
-                self.client.remove_positions(playlist_id, [0], shift_snapshot)
+                self._probe_write(self.client.remove_positions, playlist_id, [0], shift_snapshot)
             except SpotifyAPIError as exc:
                 if exc.status_code not in (400, 409, 412):
                     raise
@@ -265,7 +276,7 @@ class MigrationExecutor:
         finally:
             if playlist_id and playlist_id != plan.playlist_id:
                 try:
-                    self.client.unfollow_probe_playlist(playlist_id)
+                    self._probe_write(self.client.unfollow_probe_playlist, playlist_id)
                     probe["removed_from_library"] = True
                 except SpotifyAPIError:
                     probe["removed_from_library"] = False
@@ -281,6 +292,18 @@ class MigrationExecutor:
             ) from failure
 
     def apply(self, store: JobStore, *, retry_unconfirmed_add: bool = False) -> MigrationJournal:
+        while True:
+            try:
+                return self._apply_once(store, retry_unconfirmed_add=retry_unconfirmed_add)
+            except RateLimitError:
+                if not self.client.settings.wait_for_rate_limits:
+                    raise
+                self.client.wait_for_cooldown()
+                # Reconcile the journal and read the current ordered playlist
+                # again. Never replay an original-playlist write after a long
+                # cooldown using a position validated before the wait.
+
+    def _apply_once(self, store: JobStore, *, retry_unconfirmed_add: bool) -> MigrationJournal:
         with store.lock(), playlist_lock(store):
             plan = load_plan(store)
             if account_id(self.client) != plan.account_id:
@@ -338,6 +361,7 @@ class MigrationExecutor:
             while True:
                 validate_journal(plan, journal)
                 current = self._capture(plan.playlist_id)
+                cooldown_generation = self.client.cooldown_generation
                 actual = identities(current)
                 pending = journal.pending
                 if pending:
@@ -414,6 +438,10 @@ class MigrationExecutor:
                 after = [entry.model_copy() for entry in journal.current]
                 if journal.stage == "ready":
                     candidate = candidate_from_api(self.client.track(replacement.spotify_id))
+                    if self.client.cooldown_generation != cooldown_generation:
+                        # A track lookup can also pause for hours. Discard this
+                        # pre-wait playlist verification and scan again.
+                        continue
                     if (
                         candidate is None
                         or candidate.is_playable is not True
@@ -464,10 +492,8 @@ class MigrationExecutor:
                     plan.playlist_id, [replacement.position + 1], pending.snapshot_before
                 )
         except SpotifyAPIError as exc:
-            if isinstance(exc, RequestBudgetError) or (
-                exc.status_code is not None and 400 <= exc.status_code < 500
-            ):
-                # A local budget pause or explicit rejection has not committed this request. A
+            if exc.status_code is not None and 400 <= exc.status_code < 500:
+                # An explicit rejection has not committed this request. A
                 # transport failure/5xx/malformed successful response remains
                 # uncertain and keeps its durable intent for reconciliation.
                 journal.pending = None

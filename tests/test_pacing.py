@@ -6,7 +6,7 @@ import httpx
 import pytest
 
 from spotify_local_migrator.config import READ_SCOPES, WRITE_SCOPES
-from spotify_local_migrator.errors import RequestBudgetError, StateError
+from spotify_local_migrator.errors import StateError
 from spotify_local_migrator.matching.cache import SearchCache
 from spotify_local_migrator.matching.config import MatchingConfig
 from spotify_local_migrator.matching.engine import new_report, run_matching
@@ -31,8 +31,8 @@ class Clock:
         self.now += delay
 
 
-def pacer(data_dir, clock, *, budget=400, interval=3):
-    return RequestPacer(data_dir, interval=interval, budget=budget, clock=clock, sleep=clock.sleep)
+def pacer(data_dir, clock, *, interval=3):
+    return RequestPacer(data_dir, interval=interval, clock=clock, sleep=clock.sleep)
 
 
 def configure_clock(api, clock, *, interval=3):
@@ -51,32 +51,31 @@ def test_spacing_survives_restarts_and_idle_time(tmp_path):
     clock.now += 10
     restarted.before_request()
     assert clock.delays == [2]
-    assert restarted.usage() == (3, None)
+    assert restarted.usage() == 3
     assert json.loads(first.path.read_text())["requests"] == [1000, 1003, 1013]
     assert first.path.stat().st_mode & 0o777 == 0o600
     assert first.path.with_suffix(".lock").stat().st_mode & 0o777 == 0o600
 
 
-def test_rolling_budget_stops_without_sleep_and_expires_at_boundary(tmp_path):
+def test_usage_does_not_stop_after_400_attempts_and_expires_at_boundary(tmp_path):
     clock = Clock()
-    limiter = pacer(tmp_path, clock, budget=2)
-    limiter.before_request()
-    limiter.before_request()
-    restarted = pacer(tmp_path, clock, budget=2)
-    with pytest.raises(RequestBudgetError, match="No API request was sent"):
+    limiter = pacer(tmp_path, clock, interval=0)
+    for _ in range(401):
+        limiter.before_request()
+    restarted = pacer(tmp_path, clock, interval=0)
+    for _ in range(100):
         restarted.before_request()
-    assert restarted.usage() == (2, 1000 + WINDOW_SECONDS)
-    assert clock.delays == [3]
+    assert restarted.usage() == 501
     clock.now = 1000 + WINDOW_SECONDS
     restarted.before_request()
-    assert json.loads(restarted.path.read_text())["requests"] == [1003, clock.now]
-    assert clock.delays == [3]
+    assert json.loads(restarted.path.read_text())["requests"] == [clock.now]
+    assert clock.delays == []
 
 
-def test_recent_cache_seeds_budget_and_reports_correct_slot_when_over_budget(tmp_path):
+def test_recent_cache_seeds_usage_without_imposing_a_limit(tmp_path):
     clock = Clock()
     clock.now = 100000
-    limiter = pacer(tmp_path, clock, budget=2)
+    limiter = pacer(tmp_path, clock)
     timestamps = [1000, 99900, 99910, 99920, 99930]
     with SearchCache(limiter.cache_path) as cache:
         for index, stamp in enumerate(timestamps):
@@ -85,13 +84,10 @@ def test_recent_cache_seeds_budget_and_reports_correct_slot_when_over_budget(tmp
                 "UPDATE searches SET created = ? WHERE key = ?", (stamp, str(index))
             )
         cache.connection.commit()
-    assert limiter.usage() == (4, 99920 + WINDOW_SECONDS)
+    assert limiter.usage() == 4
     assert not limiter.path.exists()  # Status remains read-only.
-    with pytest.raises(RequestBudgetError):
-        limiter.before_request()
-    clock.now = 99920 + WINDOW_SECONDS
     limiter.before_request()
-    assert limiter.usage()[0] == 2
+    assert limiter.usage() == 5
 
 
 @pytest.mark.parametrize(
@@ -128,19 +124,13 @@ def test_failed_usage_write_blocks_http(make_api, monkeypatch):
     assert calls == []
 
 
-def test_simultaneous_clients_share_budget_without_lost_updates(tmp_path):
+def test_simultaneous_clients_share_usage_without_lost_updates(tmp_path):
     def reserve(_):
-        limiter = pacer(tmp_path, Clock(), budget=8, interval=0)
-        try:
-            limiter.before_request()
-            return True
-        except RequestBudgetError:
-            return False
+        pacer(tmp_path, Clock(), interval=0).before_request()
 
     with ThreadPoolExecutor(max_workers=8) as pool:
-        outcomes = list(pool.map(reserve, range(16)))
-    assert sum(outcomes) == 8
-    assert pacer(tmp_path, Clock(), budget=8).usage()[0] == 8
+        list(pool.map(reserve, range(16)))
+    assert pacer(tmp_path, Clock()).usage() == 16
 
 
 def test_wait_rechecks_usage_reserved_by_another_command(tmp_path):
@@ -186,10 +176,10 @@ def test_every_actual_attempt_is_paced_including_retries(make_api, token_body, f
     if first_response == "success":
         api.current_user()
     assert calls == [1000, 1007 if first_response == "429" else 1003]
-    assert api.pacer.usage()[0] == 2
+    assert api.pacer.usage() == 2
 
 
-def test_reads_and_writes_share_spacing_and_budget_across_clients(make_api, settings):
+def test_reads_and_writes_share_spacing_across_clients(make_api, settings):
     clock = Clock()
     calls = []
 
@@ -197,7 +187,6 @@ def test_reads_and_writes_share_spacing_and_budget_across_clients(make_api, sett
         calls.append((request.method, clock.now))
         return httpx.Response(200, json={"snapshot_id": "changed"})
 
-    settings.request_budget_24h = 3
     first, auth, _ = make_api(handler)
     configure_clock(first, clock)
     token = auth.store.load()
@@ -208,29 +197,13 @@ def test_reads_and_writes_share_spacing_and_budget_across_clients(make_api, sett
     first.remove_positions("A" * 22, [1], "changed")
     second, _, _ = make_api(handler)
     configure_clock(second, clock)
-    with pytest.raises(RequestBudgetError):
-        second.current_user()
-    assert calls == [("GET", 1000), ("POST", 1003), ("DELETE", 1006)]
+    second.current_user()
+    assert calls == [("GET", 1000), ("POST", 1003), ("DELETE", 1006), ("GET", 1009)]
     assert not (settings.data_dir / ".cache/rate-limit.json").exists()
 
 
-def test_retry_cannot_exceed_local_budget(make_api, settings):
+def test_cached_candidates_need_no_api_attempts(make_api, settings, capture):
     calls = []
-    settings.request_budget_24h = 1
-
-    def handler(request):
-        calls.append(request)
-        return httpx.Response(503)
-
-    api, _, _ = make_api(handler)
-    with pytest.raises(RequestBudgetError):
-        api.current_user()
-    assert len(calls) == 1
-
-
-def test_cached_candidates_need_no_request_budget(make_api, settings, capture):
-    calls = []
-    settings.request_budget_24h = 3
 
     def handler(request):
         calls.append(request)
@@ -244,18 +217,23 @@ def test_cached_candidates_need_no_request_budget(make_api, settings, capture):
         search.for_track(prepared)
         assert cache.hits == 3
     assert len(calls) == 3
-    assert api.pacer.usage()[0] == 3
+    assert api.pacer.usage() == 3
 
 
-def test_matching_budget_pause_preserves_checkpoint_and_partial_searches(
+def test_matching_cooldown_preserves_checkpoint_and_finishes_automatically(
     make_api, settings, capture, raw_local
 ):
     calls = []
     clock = Clock()
-    settings.request_budget_24h = 4
+    settings.wait_for_rate_limits = True
+    store = None
 
     def handler(request):
         calls.append(request.url.params["q"])
+        if len(calls) == 4:
+            assert len(store.report().decisions) == 1
+            assert not store.report().matching_complete
+            return httpx.Response(429, headers={"Retry-After": "86400"})
         return httpx.Response(200, json={"tracks": {"items": [], "next": None}})
 
     api, _, _ = make_api(handler)
@@ -270,16 +248,21 @@ def test_matching_budget_pause_preserves_checkpoint_and_partial_searches(
     report = new_report(capture, config, "account", ["Westside Gunn"])
     with SearchCache(settings.data_dir / ".cache/search.sqlite3") as cache:
         search = CatalogueSearch(api, config, "account", cache=cache)
-        with pytest.raises(RequestBudgetError):
-            run_matching(store, report, search)
-        checkpoint = store.report()
-        assert len(checkpoint.decisions) == 1
-        assert not checkpoint.matching_complete
-        clock.now += WINDOW_SECONDS
-        restarted, _, _ = make_api(handler)
-        configure_clock(restarted, clock, interval=0)
-        resumed_search = CatalogueSearch(restarted, config, "account", cache=cache)
-        run_matching(store, checkpoint, resumed_search)
+        run_matching(store, report, search)
     assert store.report().matching_complete
     assert len(store.report().decisions) == 2
-    assert len(calls) == 6  # Completed track and partial-query cache were reused.
+    assert len(calls) == 7  # Six successful searches and one explicit rejection.
+    assert clock.now == 1000 + WINDOW_SECONDS
+
+
+def test_adaptive_spacing_survives_restarts_and_caps_at_60_seconds(tmp_path):
+    clock = Clock()
+    limiter = pacer(tmp_path, clock)
+    limiter.before_request()
+    limiter.back_off()
+    restarted = pacer(tmp_path, clock)
+    restarted.before_request()
+    assert clock.delays == [6]
+    for _ in range(10):
+        restarted.back_off()
+    assert restarted.effective_interval() == 60

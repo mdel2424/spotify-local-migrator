@@ -6,9 +6,10 @@ import pytest
 from typer.testing import CliRunner
 
 from spotify_local_migrator import cli
+from spotify_local_migrator.config import Settings
 from spotify_local_migrator.errors import (
     PlaylistChangedError,
-    RequestBudgetError,
+    RateLimitError,
     SpotifyAPIError,
     StateError,
 )
@@ -98,6 +99,8 @@ class FakeSpotify:
         self.calls = []
         self.deleted_keys = set()
         self.auth = Mock()
+        self.settings = Settings(wait_for_rate_limits=False)
+        self.cooldown_generation = 0
         self.fail_before = None
         self.fail_after = None
         self.failure_status = None
@@ -336,26 +339,94 @@ def test_explicit_rejection_is_retryable_without_duplicate(job, kind, status):
 
 
 @pytest.mark.parametrize("kind", ["add", "delete"])
-def test_local_budget_pause_resumes_without_unconfirmed_insertion(job, monkeypatch, kind):
+def test_rate_limit_wait_resumes_without_unconfirmed_insertion(job, monkeypatch, kind):
     store, _, _, plan = job
     execution, api = executor(job)
     dispatch = api.add_tracks if kind == "add" else api.remove_positions
+    api.settings.wait_for_rate_limits = True
+    api.wait_for_cooldown = Mock()
     paused = False
 
     def pause_once(playlist_id, *args):
         nonlocal paused
         if playlist_id == api.original_id and not paused:
             paused = True
-            raise RequestBudgetError("Local budget reached; request was not dispatched.")
+            raise RateLimitError("Explicit 429 rejection.", retry_after=86400)
         return dispatch(playlist_id, *args)
 
     monkeypatch.setattr(api, "add_tracks" if kind == "add" else "remove_positions", pause_once)
-    with pytest.raises(RequestBudgetError):
-        execution.apply(store)
+    execution.apply(store)
     journal = json.loads((store.directory / "migration.json").read_text())
     assert journal["pending"] is None
-    execution.apply(store)
+    api.wait_for_cooldown.assert_called_once()
     assert identities(api.scan(api.original_id)) == plan.desired
+
+
+def test_external_edit_during_cooldown_prevents_replaying_a_stale_write(job, monkeypatch):
+    store, capture, _, _ = job
+    execution, api = executor(job)
+    api.settings.wait_for_rate_limits = True
+    dispatch = api.add_tracks
+
+    def reject_original(playlist_id, *args):
+        if playlist_id == api.original_id:
+            raise RateLimitError("Explicit 429 rejection.", retry_after=86400)
+        return dispatch(playlist_id, *args)
+
+    def edit_during_wait():
+        api.entries[api.original_id].reverse()
+        api._snapshot(api.original_id)
+
+    api.wait_for_cooldown = edit_during_wait
+    monkeypatch.setattr(api, "add_tracks", reject_original)
+    with pytest.raises(PlaylistChangedError):
+        execution.apply(store)
+    assert not original_calls(api, "add")
+    assert len(api.entries[api.original_id]) == len(capture.entries)
+
+
+def test_track_lookup_cooldown_forces_revalidation_before_insertion(job, monkeypatch):
+    store, capture, _, _ = job
+    execution, api = executor(job)
+    lookup = api.track
+
+    def delayed_lookup(track_id):
+        api.entries[api.original_id].reverse()
+        api._snapshot(api.original_id)
+        api.cooldown_generation += 1
+        return lookup(track_id)
+
+    monkeypatch.setattr(api, "track", delayed_lookup)
+    with pytest.raises(PlaylistChangedError):
+        execution.apply(store)
+    assert not original_calls(api, "add")
+    assert len(api.entries[api.original_id]) == len(capture.entries)
+
+
+@pytest.mark.parametrize(
+    "operation",
+    ["create_probe_playlist", "add_tracks", "remove_positions", "unfollow_probe_playlist"],
+)
+def test_probe_rate_limit_continues_without_creating_another_probe(job, monkeypatch, operation):
+    store, _, _, plan = job
+    execution, api = executor(job)
+    api.settings.wait_for_rate_limits = True
+    api.wait_for_cooldown = Mock()
+    request = getattr(api, operation)
+    rejected = False
+
+    def reject_once(*args):
+        nonlocal rejected
+        if not rejected:
+            rejected = True
+            raise RateLimitError("Explicit 429 rejection.", retry_after=86400)
+        return request(*args)
+
+    monkeypatch.setattr(api, operation, reject_once)
+    execution.apply(store)
+    api.wait_for_cooldown.assert_called_once()
+    assert identities(api.scan(api.original_id)) == plan.desired
+    assert sum(call[0] == "create-probe" for call in api.calls) == 1
 
 
 def test_response_acknowledgement_must_match_verified_snapshot(job):

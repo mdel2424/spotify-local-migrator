@@ -22,6 +22,7 @@ def request_json(
     sleep: Callable[[float], None] = time.sleep,
     allow_empty: bool = False,
     before_request: Callable[[], None] | None = None,
+    stop_on_rate_limit: bool = False,
     **kwargs: Any,
 ) -> tuple[int, dict[str, Any]]:
     """Bounded retries. Never log request bodies, OAuth data or server error text."""
@@ -54,10 +55,17 @@ def request_json(
                     raise ValueError
             except (KeyError, ValueError):
                 delay = None
-            if quota and delay is None:
+            reason = "QUOTA_EXCEEDED" if quota else None
+            if stop_on_rate_limit or quota:
                 raise RateLimitError(
-                    "Spotify development quota exceeded; no reset time was supplied. "
-                    "Stop and retry later (quota is shared across your developer apps)."
+                    f"{label}: Spotify {'quota exceeded' if quota else 'rate limited'}."
+                    + (
+                        f" Retry-After: {delay:g} seconds."
+                        if delay is not None
+                        else " No reset time was supplied."
+                    ),
+                    retry_after=delay,
+                    reason=reason,
                 )
             wait = delay if delay is not None else min(2**attempt, max_retry_wait)
             if attempt == max_retries or wait > max_retry_wait:

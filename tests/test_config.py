@@ -51,13 +51,13 @@ def test_invalid_env_configuration_does_not_dump_values(tmp_path):
 
 def test_pacing_defaults_and_env_overrides(tmp_path, monkeypatch):
     assert Settings().request_interval_seconds == 3
-    assert Settings().request_budget_24h == 400
+    assert Settings().wait_for_rate_limits
     env_file = tmp_path / ".env"
-    env_file.write_text("SPOTIFY_REQUEST_INTERVAL_SECONDS=5\nSPOTIFY_REQUEST_BUDGET_24H=200\n")
+    env_file.write_text("SPOTIFY_REQUEST_INTERVAL_SECONDS=5\nSPOTIFY_WAIT_FOR_RATE_LIMITS=false\n")
     monkeypatch.setenv("SPOTIFY_REQUEST_INTERVAL_SECONDS", "10")
     settings = load_settings(env_file)
     assert settings.request_interval_seconds == 10
-    assert settings.request_budget_24h == 200
+    assert not settings.wait_for_rate_limits
 
 
 @pytest.mark.parametrize(
@@ -67,8 +67,7 @@ def test_pacing_defaults_and_env_overrides(tmp_path, monkeypatch):
         ("SPOTIFY_REQUEST_INTERVAL_SECONDS", "NaN"),
         ("SPOTIFY_REQUEST_INTERVAL_SECONDS", "inf"),
         ("SPOTIFY_REQUEST_INTERVAL_SECONDS", "61"),
-        ("SPOTIFY_REQUEST_BUDGET_24H", "0"),
-        ("SPOTIFY_REQUEST_BUDGET_24H", "2.5"),
+        ("SPOTIFY_WAIT_FOR_RATE_LIMITS", "invalid"),
     ],
 )
 def test_invalid_pacing_configuration_is_rejected(tmp_path, key, value):
@@ -76,3 +75,10 @@ def test_invalid_pacing_configuration_is_rejected(tmp_path, key, value):
     env_file.write_text(f"{key}={value}\n")
     with pytest.raises(ConfigurationError):
         load_settings(env_file)
+
+
+def test_legacy_daily_budget_does_not_disable_automatic_waiting(tmp_path, monkeypatch):
+    env_file = tmp_path / ".env"
+    env_file.write_text("SPOTIFY_REQUEST_BUDGET_24H=400\n")
+    monkeypatch.setenv("SPOTIFY_REQUEST_BUDGET_24H", "400")
+    assert load_settings(env_file).wait_for_rate_limits

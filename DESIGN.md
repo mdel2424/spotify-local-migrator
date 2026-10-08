@@ -41,9 +41,14 @@ during development.
   [PKCE](https://developer.spotify.com/documentation/web-api/tutorials/code-pkce-flow),
   [redirects](https://developer.spotify.com/documentation/web-api/concepts/redirect_uri),
   [scopes](https://developer.spotify.com/documentation/web-api/concepts/scopes).
-- Prefer stable `account_id` over legacy `id` for job/cache ownership. Respect
-  Retry-After, persist long cooldowns across commands, and stop quota retries
-  without guessing reset times. Development quotas may be shared across apps.
+- Prefer stable `account_id` over legacy `id` for job/cache ownership. Space all
+  Web API attempts by 3 seconds, with persistent backoff for short burst limits
+  and usage statistics without a local daily cap. Persist every Retry-After and
+  automatically wait and continue, including day-long cooldowns. When no usable
+  header is supplied, label the increasing retry backoff as estimated rather
+  than presenting it as a Spotify reset time. Revalidate playlist state before
+  retrying a rejected original-playlist write; never retry uncertain mutations.
+  Development quotas may be shared across apps.
   [May](https://developer.spotify.com/documentation/web-api/references/changes/may-2026),
   [July](https://developer.spotify.com/documentation/web-api/references/changes/july-2026),
   [rate limits](https://developer.spotify.com/documentation/web-api/concepts/rate-limits).

@@ -152,8 +152,9 @@ def test_development_quota_without_retry_time_stops(make_api):
     api, _, delays = make_api(
         lambda _: httpx.Response(429, json={"error": {"reason": "QUOTA_EXCEEDED"}})
     )
-    with pytest.raises(RateLimitError, match="shared"):
+    with pytest.raises(RateLimitError, match="quota") as error:
         api.playlist(PLAYLIST_ID)
+    assert error.value.reason == "QUOTA_EXCEEDED"
     assert delays == []
 
 

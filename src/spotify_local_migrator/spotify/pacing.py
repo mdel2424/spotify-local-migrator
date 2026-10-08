@@ -1,4 +1,4 @@
-"""Pace every Web API attempt and persist a rolling local request budget."""
+"""Pace every Web API attempt and retain usage statistics across restarts."""
 
 import logging
 import os
@@ -6,13 +6,12 @@ import sqlite3
 import time
 from collections.abc import Callable
 from contextlib import contextmanager
-from datetime import datetime
 from pathlib import Path
 from typing import Annotated, Literal
 
 from pydantic import BaseModel, Field, ValidationError, field_validator
 
-from ..errors import RequestBudgetError, StateError
+from ..errors import StateError
 from ..migration.state import atomic_write_json
 
 logger = logging.getLogger(__name__)
@@ -23,6 +22,7 @@ Timestamp = Annotated[float, Field(ge=0, allow_inf_nan=False)]
 class RequestHistory(BaseModel):
     schema_version: Literal[1] = 1
     requests: list[Timestamp]
+    backoff_interval: float = Field(default=0, ge=0, le=60, allow_inf_nan=False)
 
     @field_validator("requests")
     @classmethod
@@ -38,7 +38,6 @@ class RequestPacer:
         data_dir: Path,
         *,
         interval: float,
-        budget: int,
         clock: Callable[[], float] = time.time,
         sleep: Callable[[float], None] = time.sleep,
     ):
@@ -47,7 +46,6 @@ class RequestPacer:
         self.path = data_dir / ".cache" / "requests.json"
         self.cache_path = data_dir / ".cache" / "search.sqlite3"
         self.interval = interval
-        self.budget = budget
         self.clock = clock
         self.sleep = sleep
 
@@ -70,7 +68,6 @@ class RequestPacer:
             if self.path.exists():
                 history = RequestHistory.model_validate_json(self.path.read_text(encoding="utf-8"))
             else:
-                # Upgrades must not grant a fresh budget after an unpaced run.
                 # Cached successes provide a lower bound for past API usage.
                 timestamps = []
                 if self.cache_path.exists():
@@ -95,15 +92,27 @@ class RequestPacer:
         history.requests = [stamp for stamp in history.requests if stamp > now - WINDOW_SECONDS]
         return history
 
-    def usage(self) -> tuple[int, float | None]:
+    def usage(self) -> int:
         """Read local usage without writing files, waiting or contacting Spotify."""
         history = self._history(self.clock())
-        available_at = (
-            history.requests[len(history.requests) - self.budget] + WINDOW_SECONDS
-            if len(history.requests) >= self.budget
-            else None
-        )
-        return len(history.requests), available_at
+        return len(history.requests)
+
+    def effective_interval(self) -> float:
+        return max(self.interval, self._history(self.clock()).backoff_interval)
+
+    def back_off(self) -> None:
+        """Slow down after a short burst limit; quotas use the server cooldown."""
+        if not self.interval:
+            return
+        try:
+            with self._lock():
+                history = self._history(self.clock())
+                history.backoff_interval = min(
+                    60.0, max(self.interval, history.backoff_interval) * 2
+                )
+                atomic_write_json(self.path, history.model_dump(mode="json"))
+        except OSError as exc:
+            raise StateError("Cannot persist Spotify pacing backoff; stop and check disk.") from exc
 
     def before_request(self) -> None:
         while True:
@@ -111,24 +120,13 @@ class RequestPacer:
                 with self._lock():
                     now = self.clock()
                     history = self._history(now)
-                    if len(history.requests) >= self.budget:
-                        available_at = (
-                            history.requests[len(history.requests) - self.budget] + WINDOW_SECONDS
-                        )
-                        when = (
-                            datetime.fromtimestamp(available_at)
-                            .astimezone()
-                            .isoformat(timespec="seconds")
-                        )
-                        raise RequestBudgetError(
-                            "Local Spotify request budget reached "
-                            f"({len(history.requests)}/{self.budget} "
-                            f"attempts in the last 24 hours). Next slot: {when}. "
-                            "No API request was sent. Matching/migration progress is saved; "
-                            "use resume when the budget allows. Inspect with status."
-                        )
                     delay = (
-                        max(0.0, history.requests[-1] + self.interval - now)
+                        max(
+                            0.0,
+                            history.requests[-1]
+                            + max(self.interval, history.backoff_interval)
+                            - now,
+                        )
                         if history.requests
                         else 0.0
                     )

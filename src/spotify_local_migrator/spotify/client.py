@@ -31,11 +31,11 @@ class SpotifyClient:
         self.auth = auth
         self.client = client
         self.sleep = sleep
+        self.cooldown_generation = 0
         self.cooldown = CooldownStore(settings.data_dir, settings.require_client_id(), clock=clock)
         self.pacer = RequestPacer(
             settings.data_dir,
             interval=settings.request_interval_seconds,
-            budget=settings.request_budget_24h,
             clock=clock,
             sleep=sleep,
         )
@@ -47,13 +47,53 @@ class SpotifyClient:
         self.cooldown.check()
 
     def _request_json(self, *args: Any, **kwargs: Any) -> tuple[int, dict[str, Any]]:
-        self.cooldown.check()
-        try:
-            return transport_request_json(*args, before_request=self._before_request, **kwargs)
-        except RateLimitError as exc:
-            if exc.retry_after is not None:
-                self.cooldown.save(exc.retry_after)
-            raise
+        method = args[1]
+
+        def before_request() -> None:
+            self._before_request()
+            # Long waits can outlast an access token. Refresh after the wait,
+            # immediately before dispatch, rather than sending an expired token.
+            if method != "GET":
+                self.auth.require_write_scopes()
+            kwargs["headers"]["Authorization"] = f"Bearer {self.auth.access_token()}"
+
+        while True:
+            if self.settings.wait_for_rate_limits and method == "GET":
+                self.wait_for_cooldown()
+            else:
+                self.cooldown.check()
+            try:
+                return transport_request_json(
+                    *args,
+                    before_request=before_request,
+                    stop_on_rate_limit=self.settings.wait_for_rate_limits,
+                    **kwargs,
+                )
+            except RateLimitError as exc:
+                if exc.retry_after is not None or self.settings.wait_for_rate_limits:
+                    delay = (
+                        exc.retry_after
+                        if exc.retry_after is not None
+                        else self.cooldown.fallback_delay(exc.reason)
+                    )
+                    self.cooldown.save(
+                        max(1.0, delay), reason=exc.reason, estimated=exc.retry_after is None
+                    )
+                if not self.settings.wait_for_rate_limits:
+                    raise
+                if exc.reason != "QUOTA_EXCEEDED" and (
+                    exc.retry_after is None or exc.retry_after <= 60
+                ):
+                    self.pacer.back_off()
+                # Writes return an explicit rejection to the executor. It will
+                # re-read and verify the playlist before attempting another write.
+                if method != "GET":
+                    raise
+                self.wait_for_cooldown()
+
+    def wait_for_cooldown(self) -> None:
+        if self.cooldown.wait(sleep=self.sleep):
+            self.cooldown_generation += 1
 
     def _get(self, endpoint: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
         token = self.auth.access_token()

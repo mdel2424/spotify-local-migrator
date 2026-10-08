@@ -10,12 +10,15 @@ check before it touches your original playlist.
 Run from this project directory:
 
 ~~~bash
-cd ~/dev/spotify-convert
-python3 -m venv .venv
+cd ~/dev/spotify-local-migrator
+python3.12 -m venv .venv
 source .venv/bin/activate
 python -m pip install -e '.[dev]'
 cp .env.example .env
 ~~~
+
+Use a versioned Python executable when creating the environment so a change to
+the system's `python3` version does not hide the installed packages.
 
 If already installed, activate your existing environment; keep the existing
 .env. Put the Spotify **Client ID** in SPOTIFY_CLIENT_ID. PKCE needs no Client
@@ -127,39 +130,57 @@ matching. `review --all` also includes automatic/unmatched decisions.
 search response reuse but never bypasses a cooldown. Verbosity precedes the
 command: `spotify-local-migrate -vv match -p ID`.
 
-## Request pacing and local budget
+## Request pacing and automatic cooldowns
 
-Every Web API attempt is spaced at least **3 seconds** apart, including search,
-playlist reads/writes, pagination and retries. A persistent local budget permits
-at most **400 attempts per rolling 24 hours**. At the budget limit the command
-stops before sending another request; completed matching decisions, cached query
-pages and migration progress remain resumable. Use `status` to see usage and the
-next budget slot, then `resume` when both the local budget and Spotify cooldown
-allow it. A large migration can span multiple days under this budget.
+Web API attempts start at least **3 seconds** apart, including search, playlist
+reads/writes, pagination and retries. There is **no local daily request cap**.
+The old `SPOTIFY_REQUEST_BUDGET_24H` setting is ignored, including an existing
+value of 400 in `.env`. Usage in `status` is informational.
+
+When Spotify returns HTTP 429, its `Retry-After` is saved to disk and honored in
+full, including a 24-hour wait. The running command prints the resume time,
+updates its countdown every five minutes, and continues automatically after the
+cooldown. Starting another API command during a saved cooldown waits as well.
+Keep the process running; no manual `resume` is needed for a cooldown. Ctrl+C
+stops the command with saved progress, and `resume --job PATH` can continue a
+matching/migration job later. `status` and `review --offline` never wait or make
+API calls.
+
+Short rate limits also double the request interval, up to 60 seconds, with that
+backoff shared across processes and persisted across restarts. A specifically
+identified `QUOTA_EXCEEDED` response uses the server cooldown without treating it
+as a burst limit. Tokens are refreshed after long waits. Before retrying an
+original-playlist write, the executor rechecks the ordered playlist and snapshot;
+external edits stop the migration. Uncertain network/write outcomes still require
+reconciliation, rather than automatic replay.
 
 Settings in `.env` (process environment takes priority):
 
 ~~~dotenv
 SPOTIFY_REQUEST_INTERVAL_SECONDS=3
-SPOTIFY_REQUEST_BUDGET_24H=400
+SPOTIFY_WAIT_FOR_RATE_LIMITS=true
 ~~~
 
-These are conservative local safeguards, not published Spotify quotas. Spotify
-has a [rolling 30-second rate limit](https://developer.spotify.com/documentation/web-api/concepts/rate-limits)
-and separate [Development Mode quota buckets](https://developer.spotify.com/documentation/web-api/concepts/quota-modes)
-whose numerical thresholds and reset schedule are not published. Pacing alone
-cannot prevent quota exhaustion; the budget limits total volume as well. Neither
-guarantees that Spotify will not return a 429, particularly if other apps on your
-developer account also make requests.
+Set `SPOTIFY_WAIT_FOR_RATE_LIMITS=false` only if a command should fail on a
+cooldown instead of waiting. Pacing and usage are shared across jobs and Client
+IDs using the same data directory, persisted in `data/.cache/requests.json` and
+protected by a POSIX process lock. Cached responses seed usage on upgrade;
+cached search hits make no requests. Usage cannot include other applications or
+another data directory.
 
-Usage and pacing are shared across jobs, processes and Client IDs using the same
-data directory, persisted in `data/.cache/requests.json`, and protected by a POSIX
-process lock. Restarts do not reset the budget. On upgrade, recent cached search
-responses seed the budget as a lower bound for earlier usage. Requests made by
-other applications or with another data directory cannot be counted locally.
-Cached search hits, `status`, offline review and complete offline dry runs consume
-no budget. Failed attempts still count. Spotify's `Retry-After` cooldown always
-takes precedence.
+If Spotify supplies no usable reset time, automatic retries use an explicitly
+estimated backoff: one hour initially for quota exhaustion, or one minute for
+other 429s, doubling on repeated missing-reset responses up to 24 hours. This is
+a retry policy, not a claim about Spotify's reset schedule.
+
+Spotify documents a [rolling 30-second rate limit](https://developer.spotify.com/documentation/web-api/concepts/rate-limits)
+and separate [Development Mode quota buckets](https://developer.spotify.com/documentation/web-api/concepts/quota-modes),
+but does not publish numerical thresholds. Developer reports are inconsistent:
+one [June 2026 report](https://www.reddit.com/r/spotifyapi/comments/1udoj6y/frustrated_by_spotify_api_429_too_many_requests/)
+describes a nearly 24-hour cooldown after roughly 300–500 requests even at one
+request per six seconds. That report is anecdotal and involves different endpoint
+usage; it is not a known search quota. The application follows Spotify's actual
+responses rather than assuming a universal request allowance.
 
 ## Matching settings
 
@@ -229,7 +250,7 @@ Keep the original audio and job files until satisfied with verification.
 ## Project and validation
 
 ~~~text
-spotify-convert/
+spotify-local-migrator/
 ├── README.md, DESIGN.md, pyproject.toml, config.example.yaml
 ├── src/spotify_local_migrator/
 │   ├── cli.py, config.py, models.py, workflow.py
