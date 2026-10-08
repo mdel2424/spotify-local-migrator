@@ -111,8 +111,9 @@ class CatalogueSearch:
                 raise SpotifyAPIError("Spotify search returned a malformed track page.")
             for raw in tracks["items"]:
                 candidate = candidate_from_api(raw)
-                if candidate:
+                if candidate and candidate.spotify_id not in candidates:
                     candidate.queries = [query]
+                    candidate.search_order = len(candidates)
                     candidates[candidate.spotify_id] = candidate
             if not tracks.get("next") or not tracks["items"]:
                 break
@@ -129,5 +130,6 @@ class CatalogueSearch:
                 if previous:
                     previous.queries = list(dict.fromkeys(previous.queries + candidate.queries))
                 else:
+                    candidate.search_order = len(candidates)
                     candidates[candidate.spotify_id] = candidate
         return list(candidates.values()), queries

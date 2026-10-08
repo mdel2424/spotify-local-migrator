@@ -2,7 +2,7 @@ from rapidfuzz import fuzz
 
 from ..models import LocalTrack
 from .config import MatchingConfig
-from .models import MatchDecision, PreparedTrack, SpotifyCandidate
+from .models import MatchDecision, MatchReport, PreparedTrack, SpotifyCandidate
 from .normalize import extract_versions, normalize
 
 
@@ -93,17 +93,98 @@ def score_candidate(
     return candidate
 
 
+def _same_track_metadata(left: SpotifyCandidate, right: SpotifyCandidate) -> bool:
+    return bool(
+        extract_versions(left.title) == extract_versions(right.title)
+        and sorted(normalize(artist) for artist in left.artists)
+        == sorted(normalize(artist) for artist in right.artists)
+        and (
+            not left.artist_ids
+            or not right.artist_ids
+            or sorted(left.artist_ids) == sorted(right.artist_ids)
+        )
+        and abs(left.duration_ms - right.duration_ms) <= 2000
+    )
+
+
 def same_recording(left: SpotifyCandidate, right: SpotifyCandidate) -> bool:
     # Album variants can share an ISRC; unknown ISRCs remain ambiguous.
     return bool(
         left.isrc
         and left.isrc == right.isrc
-        and extract_versions(left.title) == extract_versions(right.title)
-        and sorted(normalize(artist) for artist in left.artists)
-        == sorted(normalize(artist) for artist in right.artists)
-        and left.raw.get("explicit") == right.raw.get("explicit")
-        and abs(left.duration_ms - right.duration_ms) <= 2000
+        and left.explicit == right.explicit
+        and _same_track_metadata(left, right)
     )
+
+
+def equivalent_versions(left: SpotifyCandidate, right: SpotifyCandidate) -> bool:
+    # Clean/explicit counterparts can have separate ISRCs. Only a known change
+    # in that flag with otherwise identical track evidence invokes this preference.
+    return same_recording(left, right) or bool(
+        left.explicit is not None
+        and right.explicit is not None
+        and left.explicit != right.explicit
+        and _same_track_metadata(left, right)
+    )
+
+
+def group_candidates(candidates: list[SpotifyCandidate]) -> list[list[SpotifyCandidate]]:
+    """Rank distinct matches, putting the preferred release first in each group."""
+    order = {
+        candidate.spotify_id: candidate.search_order
+        if candidate.search_order is not None
+        else index
+        for index, candidate in enumerate(candidates)
+    }
+    groups: list[list[SpotifyCandidate]] = []
+    for candidate in sorted(candidates, key=lambda item: order[item.spotify_id]):
+        # Requiring agreement with every member prevents a clean counterpart
+        # from bridging two explicit tracks with different/unknown recording IDs.
+        group = next(
+            (
+                group
+                for group in groups
+                if all(equivalent_versions(candidate, other) for other in group)
+            ),
+            None,
+        )
+        if group is None:
+            groups.append([candidate])
+        else:
+            group.append(candidate)
+    for group in groups:
+        group.sort(
+            key=lambda item: (
+                0 if item.is_playable is True else 1 if item.is_playable is None else 2,
+                0 if item.explicit is True else 1,
+                order[item.spotify_id],
+            )
+        )
+    groups.sort(
+        key=lambda group: (
+            -max(item.score for item in group),
+            min(order[item.spotify_id] for item in group),
+        )
+    )
+    return groups
+
+
+def rank_candidates(
+    local: LocalTrack,
+    prepared: PreparedTrack,
+    candidates: list[SpotifyCandidate],
+    config: MatchingConfig,
+) -> list[SpotifyCandidate]:
+    scored = [score_candidate(local, prepared, candidate, config) for candidate in candidates]
+    next_order = (
+        max((item.search_order for item in scored if item.search_order is not None), default=-1) + 1
+    )
+    for candidate in scored:
+        if candidate.search_order is None:
+            # Older jobs have no search order; retain their saved display order.
+            candidate.search_order = next_order
+            next_order += 1
+    return [candidate for group in group_candidates(scored) for candidate in group]
 
 
 def decide(
@@ -114,10 +195,7 @@ def decide(
     *,
     queries: list[str] | None = None,
 ) -> MatchDecision:
-    ranked = sorted(
-        [score_candidate(local, prepared, candidate, config) for candidate in candidates],
-        key=lambda candidate: (-candidate.score, candidate.spotify_id),
-    )
+    ranked = rank_candidates(local, prepared, candidates, config)
     decision = MatchDecision(
         local_track=local, prepared=prepared, candidates=ranked, searched_queries=queries or []
     )
@@ -125,8 +203,9 @@ def decide(
         decision.reasons = ["No candidate reached the review threshold."]
         return decision
     best = ranked[0]
-    runner_up = next((other for other in ranked[1:] if not same_recording(best, other)), None)
-    margin = best.score - runner_up.score if runner_up else 1.0
+    groups = group_candidates(ranked)
+    runner_up_score = max(other.score for other in groups[1]) if len(groups) > 1 else None
+    margin = best.score - runner_up_score if runner_up_score is not None else 1.0
     gates = {
         "Score below automatic threshold": best.score >= config.auto_threshold,
         "Another recording has a similar score": margin + 1e-9 >= config.minimum_margin,
@@ -150,3 +229,23 @@ def decide(
     else:
         decision.needs_review = True
     return decision
+
+
+def refresh_automatic_choices(report: MatchReport) -> bool:
+    """Apply updated preferences offline without changing human decisions."""
+    config = MatchingConfig.model_validate(report.matching_config)
+    changed = False
+    for index, decision in enumerate(report.decisions):
+        if decision.status != "auto" or decision.review_completed:
+            continue
+        updated = decide(
+            decision.local_track,
+            decision.prepared,
+            decision.candidates,
+            config,
+            queries=decision.searched_queries,
+        )
+        if updated != decision:
+            report.decisions[index] = updated
+            changed = True
+    return changed

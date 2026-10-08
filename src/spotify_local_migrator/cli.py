@@ -417,6 +417,7 @@ def migrate(
     """Match, review, show the complete plan, then confirm before writing."""
     from rich.prompt import Confirm
 
+    from .matching.scoring import refresh_automatic_choices
     from .migration.executor import MigrationExecutor
     from .migration.planner import build_plan
     from .ui.review import show_plan
@@ -444,7 +445,12 @@ def migrate(
                 expected_artists=expected_artist,
                 no_cache=no_cache,
             )
-    report = store.report()
+    with store.lock():
+        if (store.directory / "migration.json").exists():
+            raise MigratorError("Apply already started for this job. Use resume.")
+        report = store.report()
+        if refresh_automatic_choices(report):
+            store.save("matches.json", report)
     if not no_review and any(decision.needs_review for decision in report.decisions):
         if Confirm.ask("Review ambiguous matches?", default=True):
             with services(ctx.obj) as (_, client):

@@ -197,8 +197,15 @@ at 5–30, and heavily penalized beyond 30. Scores are heuristics, not probabili
 Defaults: automatic >=0.90, review >=0.70, with a >=0.05 margin over other
 recordings. Automatic selection also needs strong title/all artist evidence,
 account playability, duration within 10 seconds, and consistent versions.
-Album variants count as the same recording only with matching ISRC,
-title/versions, artists, explicit flag and near-identical duration.
+Equivalent album releases appear as one review choice. Prefer a playable explicit
+version over its non-explicit counterpart; among equivalent releases with the same
+content rating, keep Spotify's first search result. Album duplicates require a
+shared ISRC, matching title/version and artists, and duration within 2 seconds.
+Clean/explicit counterparts may have different ISRCs, but must have known opposite
+explicit flags and the same title/version, artists and duration within 2 seconds.
+Different recordings with unknown ISRCs remain ambiguous. Alternate releases are
+retained in the saved report and shown under **Show scores**. These preferences
+also apply to manual searches and saved jobs; completed human choices are preserved.
 
 Queries broaden from title+artist filters to free text and title-only searches.
 All query variants are gathered before ranking ambiguity. SQLite cache keys

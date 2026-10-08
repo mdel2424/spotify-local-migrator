@@ -83,6 +83,16 @@ decisions require threshold, margin over different recordings, strong
 title/all artist evidence, availability and duration agreement. Scores are
 heuristics, not probabilities.
 
+Group equivalent album releases by shared ISRC, normalized title/version, artists,
+content rating and duration within 2 seconds. Known clean/explicit counterparts
+may have separate ISRCs if the remaining evidence agrees. Require pairwise
+agreement within a group so one counterpart cannot bridge distinct recordings.
+Choose a playable explicit release first, then the earliest Spotify search result
+among releases with the same rating. Persist first-seen search order; older jobs
+fall back to their saved order. Keep every release as evidence, show one preferred
+choice per group, and retain the original confidence gates. Refresh unattended
+automatic choices offline; preserve human choices and lock decisions after apply.
+
 Reviews persist each decision and manual-search provenance. Offline review can
 work on partial jobs during a cooldown. Planning still requires decisions for
 every local occurrence. Plans bind capture/report hashes and contain exact

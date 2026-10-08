@@ -1,7 +1,7 @@
 from datetime import datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, SerializerFunctionWrapHandler, model_serializer
 
 from ..models import LocalTrack
 
@@ -30,11 +30,25 @@ class SpotifyCandidate(BaseModel):
     duration_ms: int = Field(gt=0)
     is_playable: bool | None = None
     isrc: str | None = None
+    search_order: int | None = Field(default=None, ge=0)
     score: float = Field(default=0, ge=0, le=1)
     score_breakdown: dict[str, float] = Field(default_factory=dict)
     reasons: list[str] = Field(default_factory=list)
     queries: list[str] = Field(default_factory=list)
     raw: dict[str, Any] = Field(default_factory=dict)
+
+    @property
+    def explicit(self) -> bool | None:
+        value = self.raw.get("explicit")
+        return value if isinstance(value, bool) else None
+
+    @model_serializer(mode="wrap")
+    def serialize(self, handler: SerializerFunctionWrapHandler) -> dict[str, Any]:
+        data = handler(self)
+        if self.search_order is None:
+            # Preserve hashes of older reports/plans, including in-flight jobs.
+            data.pop("search_order", None)
+        return data
 
 
 class MatchDecision(BaseModel):
