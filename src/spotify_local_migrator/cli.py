@@ -308,7 +308,14 @@ def match(
         Path | None, typer.Option("--job", help="Resume an existing matching job.")
     ] = None,
     config: Annotated[Path, typer.Option("--config")] = Path("config.yaml"),
-    expected_artist: Annotated[list[str] | None, typer.Option("--expected-artist")] = None,
+    expected_artist: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--artist",
+            "--expected-artist",
+            help="Playlist artist tag; repeat for alternatives, in main or featured credits.",
+        ),
+    ] = None,
     no_cache: Annotated[bool, typer.Option("--no-cache")] = False,
 ) -> None:
     """Search, rank and save candidates. Never modify playlists."""
@@ -411,13 +418,20 @@ def migrate(
         bool, typer.Option("--no-review", help="Leave ambiguous tracks unchanged.")
     ] = False,
     config: Annotated[Path, typer.Option("--config")] = Path("config.yaml"),
-    expected_artist: Annotated[list[str] | None, typer.Option("--expected-artist")] = None,
+    expected_artist: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--artist",
+            "--expected-artist",
+            help="Playlist artist tag; repeat for alternatives, in main or featured credits.",
+        ),
+    ] = None,
     no_cache: Annotated[bool, typer.Option("--no-cache")] = False,
 ) -> None:
     """Match, review, show the complete plan, then confirm before writing."""
     from rich.prompt import Confirm
 
-    from .matching.scoring import refresh_automatic_choices
+    from .matching.scoring import refresh_unreviewed_choices
     from .migration.executor import MigrationExecutor
     from .migration.planner import build_plan
     from .ui.review import show_plan
@@ -428,7 +442,7 @@ def migrate(
     store = selected_job(ctx.obj, job) if job or latest else None
     if store and (store.directory / "migration.json").exists():
         raise MigratorError("Apply already started for this job. Use resume.")
-    if store is None or not store.report().matching_complete:
+    if store is None or not store.report().matching_complete or expected_artist:
         with services(ctx.obj) as (_, client):
             playlist_id = (
                 (parse_playlist_argument(playlist) if playlist else select_playlist(client))
@@ -449,7 +463,7 @@ def migrate(
         if (store.directory / "migration.json").exists():
             raise MigratorError("Apply already started for this job. Use resume.")
         report = store.report()
-        if refresh_automatic_choices(report):
+        if refresh_unreviewed_choices(report):
             store.save("matches.json", report)
     if not no_review and any(decision.needs_review for decision in report.decisions):
         if Confirm.ask("Review ambiguous matches?", default=True):

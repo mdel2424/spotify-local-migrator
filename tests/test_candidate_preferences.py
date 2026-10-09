@@ -16,7 +16,7 @@ from spotify_local_migrator.matching.normalize import prepare_track
 from spotify_local_migrator.matching.scoring import (
     decide,
     group_candidates,
-    refresh_automatic_choices,
+    refresh_unreviewed_choices,
 )
 from spotify_local_migrator.matching.search import CatalogueSearch, candidate_from_api
 from spotify_local_migrator.migration.executor import load_plan
@@ -222,11 +222,11 @@ def test_refresh_saved_automatic_choices_preserves_human_approvals_and_rejection
     report.decisions[2].status = "rejected"
     report.decisions[2].candidate = None
     human_rejected = report.decisions[2].model_copy(deep=True)
-    assert refresh_automatic_choices(report)
+    assert refresh_unreviewed_choices(report)
     assert report.decisions[0].candidate.spotify_id == C
     assert report.decisions[1] == human_approved
     assert report.decisions[2] == human_rejected
-    assert not refresh_automatic_choices(report)
+    assert not refresh_unreviewed_choices(report)
 
 
 def test_old_report_serialization_preserves_saved_plan_hashes(job):

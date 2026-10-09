@@ -130,6 +130,97 @@ def extract_versions(title: str) -> tuple[str, list[str]]:
     return normalize(core), sorted(set(versions))
 
 
+def artist_title_prefixes(
+    title: str, known: list[str] | None = None
+) -> list[tuple[list[str], str, str]]:
+    """Possible Artist - Title interpretations, not yet trusted artist evidence."""
+    separators = list(re.finditer(r"\s+[-–—]\s+", title))
+    result = []
+    start = 0
+    for separator in separators:
+        block = title[start : separator.start()].strip()
+        song = title[separator.end() :].strip()
+        start = separator.end()
+        if not block or not song or version_label(song):
+            continue
+        artists = unique_names(split_artists(block, known))
+        if artists and all(len(artist) <= 80 for artist in artists):
+            result.append((artists, song, title[: separator.end()].strip()))
+    return result
+
+
+def corroborate_title_artist(
+    prepared: PreparedTrack, catalogue_artists: list[str]
+) -> PreparedTrack:
+    """Use an embedded artist only when Spotify corroborates that literal credit.
+
+    Keep ordinary hyphenated titles unchanged when no prefix artist agrees.
+    Title credits can outweigh unrelated uploader tags, but explicit features
+    and version annotations remain required evidence.
+    """
+    if prepared.artist_source == "title":
+        return prepared
+    catalogue_keys = {normalize(artist) for artist in catalogue_artists}
+    for artists, title, prefix in artist_title_prefixes(prepared.title, catalogue_artists):
+        if not catalogue_keys.intersection(normalize(artist) for artist in artists):
+            continue
+        # A prefix can itself contain features, with additional features after
+        # the song title. Retain both sets rather than dropping the second one.
+        _, original_versions = extract_versions(title)
+        featured = list(prepared.featured_artists)
+        feature = FEATURE.search(title)
+        if feature:
+            credit = feature.group(1)
+            version_suffix = re.search(r"\s+[-–—]\s+(.+)$", credit)
+            if version_suffix and version_label(version_suffix.group(1)):
+                credit = credit[: version_suffix.start()]
+            featured.extend(split_artists(credit, catalogue_artists))
+            title = title[: feature.start()].strip()
+        featured = unique_names(featured)
+        all_artists = unique_names(artists + featured)
+        artist_keys = {normalize(artist) for artist in all_artists}
+        ignored = unique_names(
+            prepared.ignored_artist_tags
+            + [
+                artist
+                for artist in prepared.primary_artists
+                if prepared.artist_source == "metadata" and normalize(artist) not in artist_keys
+            ]
+        )
+        warnings = [
+            warning
+            for warning in prepared.warnings
+            if warning
+            not in (
+                "No reliable artist evidence; automatic selection is disabled.",
+                "Filename-like title provides weak identity evidence.",
+            )
+        ]
+        if ignored:
+            warnings.append("Artist tags differ from title/playlist artist evidence.")
+        core, versions = extract_versions(title)
+        versions = sorted(set(prepared.qualifiers + original_versions + versions))
+        filename_like = bool(re.fullmatch(r"(?:track|audio|unknown|untitled)\s*\d*", core))
+        if filename_like:
+            warnings.append("Filename-like title provides weak identity evidence.")
+        return prepared.model_copy(
+            update={
+                "title": title,
+                "core_title": core,
+                "qualifiers": versions,
+                "artists": all_artists,
+                "primary_artists": artists,
+                "featured_artists": featured,
+                "artist_source": "title",
+                "filename_like": filename_like,
+                "ignored_artist_tags": ignored,
+                "removed_annotations": prepared.removed_annotations + [prefix],
+                "warnings": list(dict.fromkeys(warnings)),
+            }
+        )
+    return prepared
+
+
 def prepare_track(
     track: LocalTrack,
     expected_artists: list[str],
@@ -208,7 +299,7 @@ def prepare_track(
 
     title = BRACKETS.sub(clean_bracket, title)
     feature = FEATURE.search(title)
-    if feature:
+    if feature and not any(FEATURE.search(prefix) for _, _, prefix in artist_title_prefixes(title)):
         featured.extend(split_artists(feature.group(1), known))
         removed.append(title[feature.start() :])
         title = title[: feature.start()]

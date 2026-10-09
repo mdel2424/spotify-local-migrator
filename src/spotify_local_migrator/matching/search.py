@@ -8,7 +8,7 @@ from ..spotify.client import SpotifyClient
 from .cache import SearchCache
 from .config import MatchingConfig
 from .models import PreparedTrack, SpotifyCandidate
-from .normalize import normalize
+from .normalize import artist_title_prefixes, extract_versions, normalize
 
 ID = re.compile(r"[A-Za-z0-9]{22}")
 
@@ -63,6 +63,14 @@ def search_queries(prepared: PreparedTrack) -> list[str]:
     if not title:
         return []
     queries = []
+    if prepared.artist_source != "title":
+        # Add precise searches for unconfirmed title prefixes. Preserve the
+        # original queries so ordinary hyphenated song titles still resolve.
+        for artists, song, _ in artist_title_prefixes(prepared.title):
+            core, _ = extract_versions(song)
+            if core:
+                for artist in artists[:3]:
+                    queries.append(f'track:"{core}" artist:"{normalize(artist)}"')
     for artist in prepared.primary_artists[:3]:
         queries.append(f'track:"{title}" artist:"{normalize(artist)}"')
     if prepared.primary_artists:

@@ -10,7 +10,7 @@ from .errors import StateError
 from .matching.cache import SearchCache
 from .matching.config import MatchingConfig, load_matching_config
 from .matching.engine import new_report, run_matching
-from .matching.normalize import prepare_track
+from .matching.normalize import prepare_track, unique_names
 from .matching.scoring import decide
 from .matching.search import CatalogueSearch, search_queries
 from .migration.jobs import JobStore
@@ -58,6 +58,11 @@ def match_job(
             raise StateError("This matching job belongs to another Spotify account.")
         if (store.directory / "migration.json").exists():
             raise StateError("Apply already started. Use resume for this job.")
+        if expected_artists:
+            # Explicit new tags can refine a saved matching job. The retained
+            # decision loop below preserves completed human approvals/rejections.
+            report.expected_artists = unique_names(expected_artists)
+            report.expected_artist_source = "configured"
     console.print(Text(f"Job: {store.directory}"))
     config = MatchingConfig.model_validate(report.matching_config)
     with (

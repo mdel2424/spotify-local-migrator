@@ -3,7 +3,7 @@ from rapidfuzz import fuzz
 from ..models import LocalTrack
 from .config import MatchingConfig
 from .models import MatchDecision, MatchReport, PreparedTrack, SpotifyCandidate
-from .normalize import extract_versions, normalize
+from .normalize import corroborate_title_artist, extract_versions, normalize
 
 
 def similarity(left: str | None, right: str | None) -> float:
@@ -27,12 +27,24 @@ def score_candidate(
     local: LocalTrack, prepared: PreparedTrack, candidate: SpotifyCandidate, config: MatchingConfig
 ) -> SpotifyCandidate:
     candidate = candidate.model_copy(deep=True)
+    prepared = corroborate_title_artist(prepared, candidate.artists)
     candidate_core, candidate_versions = extract_versions(candidate.title)
     title = similarity(prepared.core_title, candidate_core)
-    artist_scores = [
-        max((similarity(artist, other) for other in candidate.artists), default=0)
-        for artist in prepared.artists
-    ]
+
+    def artist_similarity(artist):
+        return max((similarity(artist, other) for other in candidate.artists), default=0)
+
+    if prepared.artist_source in ("configured", "inferred"):
+        # Playlist tags describe alternative artists, not a claim that every
+        # listed artist appears on every song. Any main or featured credit can
+        # supply that context; actual per-track features are still mandatory.
+        artist_scores = (
+            [max((artist_similarity(artist) for artist in prepared.primary_artists), default=0)]
+            if prepared.primary_artists
+            else []
+        ) + [artist_similarity(artist) for artist in prepared.featured_artists]
+    else:
+        artist_scores = [artist_similarity(artist) for artist in prepared.artists]
     artist = sum(artist_scores) / len(artist_scores) if artist_scores else 0
     values = {"title": title}
     if prepared.artists:
@@ -169,12 +181,42 @@ def group_candidates(candidates: list[SpotifyCandidate]) -> list[list[SpotifyCan
     return groups
 
 
-def rank_candidates(
+def review_evidence(
+    local: LocalTrack, candidate: SpotifyCandidate, config: MatchingConfig
+) -> str | None:
+    """Require independent identity evidence, not just a weighted total."""
+    if candidate.is_playable is False:
+        return None
+    title = candidate.score_breakdown.get("title", 0)
+    artist = candidate.score_breakdown.get("artist_minimum", 0)
+    if title >= 0.90 and artist >= 0.90:
+        # SoundCloud uploads can include intros/outros or use another edit.
+        # Duration and version differences need a human, not silent rejection.
+        return "Strong title and artist agreement warrants review despite other differences."
+    if title >= 0.94 and local.duration_ms:
+        difference = abs(local.duration_ms - candidate.duration_ms)
+        if difference <= 10000 and difference / local.duration_ms <= 0.05:
+            # Stage names, aliases and uploader tags can disagree. This is
+            # evidence for human review only; it never establishes artist identity.
+            return "Strong title and close duration warrant review; confirm the artist."
+    if candidate.score >= config.review_threshold and title >= 0.60 and artist >= 0.60:
+        return "Title and artist evidence support review."
+    if (
+        candidate.score >= config.auto_threshold
+        and title >= config.auto_title_minimum
+        and artist >= config.auto_artist_minimum
+    ):
+        # Respect explicitly customized automatic evidence thresholds too.
+        return "Candidate meets the configured automatic title and artist requirements."
+    return None
+
+
+def rank_candidate_groups(
     local: LocalTrack,
     prepared: PreparedTrack,
     candidates: list[SpotifyCandidate],
     config: MatchingConfig,
-) -> list[SpotifyCandidate]:
+) -> list[list[SpotifyCandidate]]:
     scored = [score_candidate(local, prepared, candidate, config) for candidate in candidates]
     next_order = (
         max((item.search_order for item in scored if item.search_order is not None), default=-1) + 1
@@ -184,7 +226,25 @@ def rank_candidates(
             # Older jobs have no search order; retain their saved display order.
             candidate.search_order = next_order
             next_order += 1
-    return [candidate for group in group_candidates(scored) for candidate in group]
+    groups = group_candidates(scored)
+    # A plausible lower-scoring recording must not be hidden by a higher total
+    # assembled from weak title/artist evidence. Preserve release preferences
+    # and score order within each eligibility tier.
+    groups.sort(key=lambda group: review_evidence(local, group[0], config) is None)
+    return groups
+
+
+def rank_candidates(
+    local: LocalTrack,
+    prepared: PreparedTrack,
+    candidates: list[SpotifyCandidate],
+    config: MatchingConfig,
+) -> list[SpotifyCandidate]:
+    return [
+        candidate
+        for group in rank_candidate_groups(local, prepared, candidates, config)
+        for candidate in group
+    ]
 
 
 def decide(
@@ -195,16 +255,19 @@ def decide(
     *,
     queries: list[str] | None = None,
 ) -> MatchDecision:
-    ranked = rank_candidates(local, prepared, candidates, config)
+    groups = rank_candidate_groups(local, prepared, candidates, config)
+    ranked = [candidate for group in groups for candidate in group]
     decision = MatchDecision(
         local_track=local, prepared=prepared, candidates=ranked, searched_queries=queries or []
     )
-    if not ranked or ranked[0].score < config.review_threshold:
-        decision.reasons = ["No candidate reached the review threshold."]
+    if ranked:
+        decision.prepared = corroborate_title_artist(prepared, ranked[0].artists)
+        prepared = decision.prepared
+    if not ranked:
+        decision.reasons = ["No candidates found."]
         return decision
     best = ranked[0]
-    groups = group_candidates(ranked)
-    runner_up_score = max(other.score for other in groups[1]) if len(groups) > 1 else None
+    runner_up_score = max((other.score for group in groups[1:] for other in group), default=None)
     margin = best.score - runner_up_score if runner_up_score is not None else 1.0
     gates = {
         "Score below automatic threshold": best.score >= config.auto_threshold,
@@ -226,17 +289,21 @@ def decide(
     if not decision.reasons:
         decision.status = "auto"
         decision.candidate = best
-    else:
+    elif evidence := review_evidence(local, best, config):
         decision.needs_review = True
+        if best.score < config.review_threshold:
+            decision.reasons.append(evidence)
+    else:
+        decision.reasons = ["No candidate has sufficient supporting evidence for review."]
     return decision
 
 
-def refresh_automatic_choices(report: MatchReport) -> bool:
-    """Apply updated preferences offline without changing human decisions."""
+def refresh_unreviewed_choices(report: MatchReport) -> bool:
+    """Refresh stored evidence offline without changing completed human decisions."""
     config = MatchingConfig.model_validate(report.matching_config)
     changed = False
     for index, decision in enumerate(report.decisions):
-        if decision.status != "auto" or decision.review_completed:
+        if decision.review_completed or decision.status in ("approved", "rejected"):
             continue
         updated = decide(
             decision.local_track,
@@ -245,6 +312,14 @@ def refresh_automatic_choices(report: MatchReport) -> bool:
             config,
             queries=decision.searched_queries,
         )
+        if decision.status != "auto" and updated.status == "auto":
+            # Review may have only older or manually collected search results.
+            # Reopening that queue must not silently accept a previously
+            # unselected track; matching can establish a fresh automatic choice.
+            updated.status = "unmatched"
+            updated.candidate = None
+            updated.needs_review = True
+            updated.reasons = ["Stored candidate now meets automatic criteria; confirm the match."]
         if updated != decision:
             report.decisions[index] = updated
             changed = True

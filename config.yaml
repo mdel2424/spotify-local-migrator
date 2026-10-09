@@ -1,0 +1,92 @@
+# Copy to config.yaml. Keys can be playlist names or Spotify playlist IDs.
+# Artist tags are alternatives; a matching artist can be main or featured.
+playlists:
+  "killjae untitled":
+    expected_artists: ["killjae"]
+  "liloDraccem":
+    expected_artists: []
+  "smokedope+nokia":
+    expected_artists: ["smokedope2016", "nokia angel"]
+  "💌":
+    expected_artists: ["myspacemark", "zane lynchetti"]
+  "smoove":
+    expected_artists: ["baby smoove"]
+  "marjorie":
+    expected_artists: ["marjorie w.c. sinclair"]
+  "🇫🇷":
+    expected_artists: ["63og", "jeune morty", "bedry"]
+  "best of miles":
+    expected_artists: ["9tails", "sewerperson"]
+  "reserv+kaiden":
+    expected_artists: ["reserve", "kaiden"]
+  "dxrt":
+    expected_artists: ["2sdxrt3all"]
+  "fakemink+harto+kasper+moh":
+    expected_artists: ["fakemink", "harto falion", "kasper gem", "moh baretta"]
+  "🇸🇪":
+    expected_artists: []
+  "lucki":
+    expected_artists: ["lucki"]
+  "bbg":
+    expected_artists: ["bigbabygucci"]
+  "drake":
+    expected_artists: ["drake"]
+  "sosa":
+    expected_artists: ["chief keef"]
+  "switchTwin":
+    expected_artists: ["osamason", "lil o", "vlorich"]
+  "glaive+kennedy+kurtains":
+    expected_artists: ["glaive", "kennedyxoxo", "kurtains"]
+  "izzy":
+    expected_artists: ["izaya tiji"]
+  "amg":
+    expected_artists: []
+  "steven moses":
+    expected_artists: ["steven moses"]
+  "brent":
+    expected_artists: ["brent faiyaz"]
+  "zuke":
+    expected_artists: ["zukenee"]
+  "dro":
+    expected_artists: ["dro kenji"]
+  "resi":
+    expected_artists: ["residential", "not home."]
+  "shine+corey":
+    expected_artists: ["lil shine", "corey lingo"]
+  "santan":
+    expected_artists: ["dave"]
+  "drain gang 🌠":
+    expected_artists: []
+  "peep":
+    expected_artists: ["lil peep"]
+  "spook":
+    expected_artists: ["corbin"]
+
+auto_threshold: 0.90
+# Baseline for partial title matches with supporting artist evidence.
+# Strong title/artist or title/duration agreement can still reach review below it.
+review_threshold: 0.70
+minimum_margin: 0.05
+auto_title_minimum: 0.94
+auto_artist_minimum: 0.95
+
+weights:
+  title: 0.50
+  artist: 0.30
+  duration: 0.15
+  album: 0.05
+
+version_penalty: 0.22
+remaster_penalty: 0.08
+search_pages: 2        # 10 Spotify results per page, per query
+cache_ttl_days: 7
+# market: CA         # Your account country takes priority with user authorization.
+
+# Explicit Prod./p. annotations are learned across a playlist.
+# Add ambiguous credit names here after inspecting scan output.
+producer_names:
+  - resonance
+  - reesy4k
+  - gelatoo
+
+uploader_names: []

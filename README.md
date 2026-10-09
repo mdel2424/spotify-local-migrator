@@ -11,11 +11,17 @@ duplicates, and unmatched local files.
 
 The scanner captures every ordered playlist occurrence. Matching cleans title
 annotations, extracts artist and producer credits, and searches Spotify using
-several title/artist queries. Default scoring weights are title 50%, artist 30%,
-duration 15%, and album 5%; missing fields redistribute the weights. Automatic
+several title/artist queries. An embedded `Artist - Title` credit takes priority
+over uploader tags when the Spotify artist corroborates it. Default scoring
+weights are title 50%, artist 30%, duration 15%, and album 5%; missing fields
+redistribute the weights. Automatic
 selection requires a score of at least 90%, sufficient title/artist evidence,
 compatible versions, duration agreement, and a margin over other recordings.
-Scores of at least 70% are eligible for review.
+Review normally requires at least 70% plus supporting title and artist evidence.
+Strong title/artist agreement can reach review despite runtime or version
+differences. A near-exact title and close runtime (within 10 seconds and 5%)
+can reach review with conflicting artist tags; artist identity still needs
+confirmation. Plausible matches appear before results with weak identity evidence.
 
 Equivalent album releases are grouped using recording identifiers, title,
 artists, and duration. Playable explicit versions take priority over clean
@@ -82,8 +88,23 @@ instead of waiting. Process environment variables override `.env`.
 
 For matching overrides, copy `config.example.yaml` to `config.yaml` and edit
 artist hints, producer names, thresholds, or weights. `match` and `migrate`
-accept `--config PATH` and repeatable `--expected-artist NAME`. Existing jobs
-retain their original matching configuration.
+accept `--config PATH` and repeatable `--artist NAME` (`--expected-artist` also
+works). Playlist tags are alternatives: any tagged artist can appear as a main
+or featured artist. Features explicitly named in a track remain required.
+
+```yaml
+playlists:
+  spook:  # Playlist name or Spotify playlist ID
+    expected_artists: [Corbin]
+  "Corbin and Shlohmo":
+    expected_artists: [Corbin, Shlohmo]
+```
+
+Existing jobs retain their saved configuration. To update artist tags while
+keeping completed human reviews, use
+`match --job PATH --artist Corbin` (repeat `--artist` for more names).
+Review recalculates unattended saved candidates with the current scoring rules,
+including previously unmatched tracks, without repeating completed human reviews.
 
 ## Usage
 

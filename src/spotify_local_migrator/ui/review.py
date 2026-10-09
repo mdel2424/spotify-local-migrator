@@ -6,7 +6,8 @@ from rich.text import Text
 from ..errors import StateError
 from ..matching.config import MatchingConfig
 from ..matching.models import MatchDecision, MatchReport
-from ..matching.scoring import group_candidates, rank_candidates, refresh_automatic_choices
+from ..matching.normalize import corroborate_title_artist
+from ..matching.scoring import rank_candidate_groups, refresh_unreviewed_choices
 from ..matching.search import CatalogueSearch
 from ..migration.jobs import JobStore
 from ..migration.planner import MigrationPlan
@@ -41,7 +42,7 @@ def show_results(console: Console, report: MatchReport) -> None:
     console.print(table)
     console.print(
         Text(
-            "Expected artists: "
+            "Playlist artist tags: "
             + ", ".join(report.expected_artists)
             + f" ({report.expected_artist_source})"
         )
@@ -55,9 +56,12 @@ def review_decision(
     config: MatchingConfig,
 ) -> None:
     local = decision.local_track
-    decision.candidates = rank_candidates(local, decision.prepared, decision.candidates, config)
-    groups = group_candidates(decision.candidates)[:10]
+    ranked_groups = rank_candidate_groups(local, decision.prepared, decision.candidates, config)
+    decision.candidates = [candidate for group in ranked_groups for candidate in group]
+    groups = ranked_groups[:10]
     candidates = [group[0] for group in groups]
+    if candidates:
+        decision.prepared = corroborate_title_artist(decision.prepared, candidates[0].artists)
     warnings = decision.prepared.warnings + decision.reasons
     show_others = False
     while True:
@@ -104,8 +108,11 @@ def review_decision(
             query = Prompt.ask("Spotify search query").strip()
             if not query:
                 continue
-            ranked = rank_candidates(local, decision.prepared, search.query(query), config)
-            groups = group_candidates(ranked)[:10]
+            ranked_groups = rank_candidate_groups(
+                local, decision.prepared, search.query(query), config
+            )
+            ranked = [candidate for group in ranked_groups for candidate in group]
+            groups = ranked_groups[:10]
             candidates = [group[0] for group in groups]
             warnings = decision.prepared.warnings + (candidates[0].reasons if candidates else [])
             show_others = False
@@ -171,7 +178,7 @@ def review_report(
 ) -> MatchReport:
     if (store.directory / "migration.json").exists():
         raise StateError("Apply already started; decisions are locked. Use resume.")
-    if refresh_automatic_choices(report):
+    if refresh_unreviewed_choices(report):
         store.save("matches.json", report)
     config = MatchingConfig.model_validate(report.matching_config)
     for decision in report.decisions:

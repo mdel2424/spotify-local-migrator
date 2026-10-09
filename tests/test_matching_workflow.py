@@ -83,7 +83,7 @@ def test_more_real_scan_annotations(capture, title, cleaned):
     assert prepare_track(local, ["2sdxrt3all"], ["whyceg"]).title == cleaned
 
 
-def test_wrong_artist_cannot_be_a_reliable_match(capture):
+def test_exact_title_and_duration_with_wrong_artist_require_human_confirmation(capture):
     local = capture.local_tracks[0]
     raw = raw_track(A)
     raw["artists"] = [{"name": "Completely Different Person"}]
@@ -91,7 +91,8 @@ def test_wrong_artist_cannot_be_a_reliable_match(capture):
     prepared = prepare_track(local, ["Westside Gunn"], [])
     decision = decide(local, prepared, [candidate], MatchingConfig())
     assert decision.status == "unmatched"
-    assert not decision.needs_review
+    assert decision.needs_review
+    assert decision.candidate is None
     assert decision.candidates[0].score < 0.7
 
 
