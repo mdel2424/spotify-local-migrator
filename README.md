@@ -100,6 +100,10 @@ spotify-local-migrate migrate --latest
 
 Apply displays the plan and asks for confirmation before writing. Ambiguous
 matches can be approved, searched manually, or left unchanged.
+During review, press **Enter** to accept the top match or **Escape** to leave the
+track unmatched. Local and Spotify metadata appear side by side, with differences
+highlighted and a duration delta. Other matches are available on demand;
+numbered choices remain available.
 
 To select another playlist directly:
 

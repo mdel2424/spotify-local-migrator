@@ -1,5 +1,5 @@
 from rich.console import Console
-from rich.prompt import IntPrompt, Prompt
+from rich.prompt import Prompt
 from rich.table import Table
 from rich.text import Text
 
@@ -10,13 +10,8 @@ from ..matching.scoring import group_candidates, rank_candidates, refresh_automa
 from ..matching.search import CatalogueSearch
 from ..migration.jobs import JobStore
 from ..migration.planner import MigrationPlan
-
-
-def duration(milliseconds: int | None) -> str:
-    if not milliseconds:
-        return "unknown"
-    seconds = milliseconds // 1000
-    return f"{seconds // 60}:{seconds % 60:02d}"
+from .comparison import show_comparison, show_other_matches
+from .prompts import ReviewChoicePrompt
 
 
 def content_rating(explicit: bool | None) -> str:
@@ -60,36 +55,45 @@ def review_decision(
     config: MatchingConfig,
 ) -> None:
     local = decision.local_track
-    console.print(Text(f"\nLocal occurrence #{local.playlist_position + 1}: {local.title or '?'}"))
-    console.print(Text(f"Tags: {', '.join(local.artists) or 'missing'}"))
-    console.print(
-        Text(
-            f"Cleaned: {decision.prepared.title} | "
-            f"Artists: {', '.join(decision.prepared.artists)} | "
-            f"Album: {local.album or 'missing'} | Duration: {duration(local.duration_ms)}"
-        )
-    )
-    for warning in decision.prepared.warnings + decision.reasons:
-        console.print(Text(warning, style="yellow"))
     decision.candidates = rank_candidates(local, decision.prepared, decision.candidates, config)
     groups = group_candidates(decision.candidates)[:10]
     candidates = [group[0] for group in groups]
+    warnings = decision.prepared.warnings + decision.reasons
+    show_others = False
     while True:
-        for index, candidate in enumerate(candidates, 1):
-            alternatives = len(groups[index - 1]) - 1
+        show_comparison(console, decision, candidates[0] if candidates else None)
+        if candidates:
+            candidate = candidates[0]
+            alternatives = len(groups[0]) - 1
             releases = f" | {alternatives} alternate release(s)" if alternatives else ""
             console.print(
                 Text(
-                    f"{index}. {', '.join(candidate.artists)} - {candidate.title}\n"
-                    f"   {candidate.album or '?'} | {duration(candidate.duration_ms)} | "
                     f"{content_rating(candidate.explicit)}{releases} | "
-                    f"{candidate.score:.0%} | "
                     f"https://open.spotify.com/track/{candidate.spotify_id}"
                 )
             )
+            if candidate.is_playable is not True:
+                console.print(
+                    "Top match's availability is unconfirmed; choose another.", style="yellow"
+                )
+        for warning in dict.fromkeys(warnings):
+            console.print(Text(warning, style="yellow"))
+        if show_others:
+            show_other_matches(console, candidates)
         manual, leave, debug = len(candidates) + 1, len(candidates) + 2, len(candidates) + 3
+        more = len(candidates) + 4
+        if len(candidates) > 1:
+            console.print(
+                f"{more}. Show {len(candidates) - 1} other matches (choices 2–{len(candidates)})"
+            )
         console.print(f"{manual}. Search manually\n{leave}. Leave unchanged\n{debug}. Show scores")
-        choice = IntPrompt.ask("Choice", default=leave)
+        default = 1 if candidates else leave
+        shortcut = (
+            "Enter: accept top match; Esc: leave unchanged"
+            if candidates
+            else "Enter/Esc: leave unchanged"
+        )
+        choice = ReviewChoicePrompt.ask(f"Choice ({shortcut})", default=default, console=console)
         if choice == manual:
             if getattr(search, "offline", False):
                 console.print(
@@ -103,6 +107,8 @@ def review_decision(
             ranked = rank_candidates(local, decision.prepared, search.query(query), config)
             groups = group_candidates(ranked)[:10]
             candidates = [group[0] for group in groups]
+            warnings = decision.prepared.warnings + (candidates[0].reasons if candidates else [])
+            show_others = False
             decision.searched_queries.append(query)
             known = {candidate.spotify_id for candidate in decision.candidates}
             next_order = (
@@ -121,10 +127,12 @@ def review_decision(
                     candidate.search_order = next_order
                     next_order += 1
                     decision.candidates.append(candidate)
-        elif choice == leave:
+        elif choice in (leave, ReviewChoicePrompt.ESCAPE):
             decision.status = "rejected"
             decision.candidate = None
             break
+        elif choice == more and len(candidates) > 1:
+            show_others = True
         elif choice == debug:
             for group in groups:
                 for candidate in group:
