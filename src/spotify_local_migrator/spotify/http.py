@@ -1,5 +1,6 @@
 import logging
 import math
+import re
 import time
 from collections.abc import Callable
 from typing import Any
@@ -9,6 +10,46 @@ import httpx
 from ..errors import RateLimitError, SpotifyAPIError
 
 logger = logging.getLogger(__name__)
+
+
+def safe_error_body(response: httpx.Response, request_options: dict[str, Any]) -> dict[str, Any]:
+    """Keep only diagnostic fields, removing credentials and URLs before display."""
+    try:
+        body = response.json()
+    except ValueError:
+        return {}
+    error = body.get("error") if isinstance(body, dict) else None
+    if not isinstance(error, dict):
+        return {}
+    details = {}
+    message = error.get("message")
+    if isinstance(message, str):
+        # A server can echo submitted credentials. Do not include other fields
+        # or complete response bodies, including OAuth error descriptions.
+        sensitive = []
+        for key, value in (request_options.get("headers") or {}).items():
+            if key.lower() == "authorization" and isinstance(value, str):
+                sensitive.extend([value, value.removeprefix("Bearer ")])
+        for collection in ("data", "json", "params"):
+            values = request_options.get(collection)
+            if isinstance(values, dict):
+                sensitive.extend(
+                    value
+                    for key, value in values.items()
+                    if isinstance(value, str)
+                    and any(name in key.lower() for name in ("token", "secret", "verifier", "code"))
+                )
+        for value in sorted(set(sensitive), key=len, reverse=True):
+            if value:
+                message = message.replace(value, "[redacted]")
+        message = re.sub(r"https?://\S+", "[URL omitted]", message)
+        message = re.sub(r"(?i)bearer\s+[^\s,;]+", "Bearer [redacted]", message)
+        message = "".join(char for char in message if char.isprintable() or char.isspace())
+        details["message"] = " ".join(message.split())[:300]
+    reason = error.get("reason")
+    if isinstance(reason, str) and re.fullmatch(r"[A-Z][A-Z_]{0,79}", reason):
+        details["reason"] = reason
+    return {"error": details} if details else {}
 
 
 def request_json(
@@ -86,7 +127,7 @@ def request_json(
             continue
 
         if not 200 <= response.status_code < 300:
-            return response.status_code, {}
+            return response.status_code, safe_error_body(response, kwargs)
         if allow_empty and not response.content:
             return response.status_code, {}
         try:

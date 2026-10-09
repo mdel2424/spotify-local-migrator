@@ -489,6 +489,13 @@ def resume(
             "--retry-unconfirmed", help="Confirm retry of a possibly in-flight insertion."
         ),
     ] = False,
+    retry_unconfirmed_delete: Annotated[
+        bool,
+        typer.Option(
+            "--retry-unconfirmed-delete",
+            help="Confirm retry only after inspecting an uncertain deletion that did not commit.",
+        ),
+    ] = False,
 ) -> None:
     """Reconcile interrupted apply, or continue interrupted read-only matching."""
     from rich.prompt import Confirm
@@ -509,10 +516,21 @@ def resume(
         )
         if not Confirm.ask("Retry an unconfirmed insertion if still absent?", default=False):
             retry_unconfirmed = False
+    if retry_unconfirmed_delete:
+        console.print(
+            "An unconfirmed deletion may still be in flight. Wait and inspect Spotify first. "
+            "Only retry after confirming it did not commit; a late commit can delete another item."
+        )
+        if not Confirm.ask("Retry an unconfirmed deletion if still unchanged?", default=False):
+            retry_unconfirmed_delete = False
     with services(ctx.obj) as (_, client):
         result = MigrationExecutor(
             client, progress=lambda message: console.print(Text(message))
-        ).apply(store, retry_unconfirmed_add=retry_unconfirmed)
+        ).apply(
+            store,
+            retry_unconfirmed_add=retry_unconfirmed,
+            retry_unconfirmed_delete=retry_unconfirmed_delete,
+        )
     console.print(f"{result.phase}: {result.next_replacement} replacements verified.")
 
 

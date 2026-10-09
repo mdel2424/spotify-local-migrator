@@ -1,290 +1,141 @@
 # Spotify Local Track Migrator
 
-Python 3.12+ CLI for replacing local-file occurrences with Spotify catalogue
-tracks. Search/review/dry-run are read-only. Apply requires write authorization,
-a displayed plan with default-No confirmation, and an isolated compatibility
-check before it touches your original playlist.
+## Description
 
-## Install and connect
+A Python 3.12+ CLI that replaces local-file occurrences in Spotify playlists
+with matching Spotify catalogue tracks. It supports automatic matching, manual
+review, dry runs, and resumable migration while preserving track order,
+duplicates, and unmatched local files.
 
-Run from this project directory:
+## Implementation details
 
-~~~bash
-cd ~/dev/spotify-local-migrator
+The scanner captures every ordered playlist occurrence. Matching cleans title
+annotations, extracts artist and producer credits, and searches Spotify using
+several title/artist queries. Default scoring weights are title 50%, artist 30%,
+duration 15%, and album 5%; missing fields redistribute the weights. Automatic
+selection requires a score of at least 90%, sufficient title/artist evidence,
+compatible versions, duration agreement, and a margin over other recordings.
+Scores of at least 70% are eligible for review.
+
+Equivalent album releases are grouped using recording identifiers, title,
+artists, and duration. Playable explicit versions take priority over clean
+counterparts; otherwise, Spotify's first matching search result is preferred.
+Manual choices remain saved.
+
+Migration works from the bottom of the playlist upward. It inserts a replacement
+before its local occurrence, verifies the complete sequence, removes the shifted
+local by position, and verifies again. A temporary private playlist checks
+positional removal before the original is changed. Successful checks are reused
+for 24 hours for the same account, app, and unchanged job. Delayed snapshot reads
+are reconciled against recorded mutation versions and exact track order.
+
+Jobs under `data/<playlist-id>/jobs/<job-id>/` store `original.json`,
+`matches.json`, `plan.json`, compatibility-check records, and `migration.json`.
+Mutation intent is saved before each write so resume can reconcile interrupted
+operations without repeating completed replacements. Search responses are cached
+in SQLite. Atomic state writes and process locks protect saved progress;
+migration locking requires Linux or macOS.
+
+API requests are paced at least 3 seconds apart by default, with no local daily
+request cap. HTTP 429 cooldowns are persisted and waited out automatically,
+including 24-hour waits. Short rate limits increase the request interval.
+Unexpected playlist changes stop further writes; uncertain mutations are not
+automatically replayed.
+
+## Setup
+
+Run from the project directory:
+
+```bash
 python3.12 -m venv .venv
 source .venv/bin/activate
-python -m pip install -e '.[dev]'
+python -m pip install -e .
 cp .env.example .env
-~~~
+```
 
-Use a versioned Python executable when creating the environment so a change to
-the system's `python3` version does not hide the installed packages.
+Create a Spotify Web API app and register this exact redirect URI:
 
-If already installed, activate your existing environment; keep the existing
-.env. Put the Spotify **Client ID** in SPOTIFY_CLIENT_ID. PKCE needs no Client
-Secret. Git ignores .env, tokens, captures, cache and migration state.
-
-In the developer dashboard choose **Web API**, a name such as **Local Track
-Migrator** (the name cannot start with “Spot”), and a description such as
-“Match local playlist files to Spotify catalogue tracks.” Website is optional.
-Register this exact redirect:
-
-~~~text
+```text
 http://127.0.0.1:8765/callback
-~~~
+```
 
-Development apps require the applicable Premium/allowlisted-user conditions.
-Authorize on your own machine:
+Set `SPOTIFY_CLIENT_ID` in `.env` to the app's Client ID. Authentication uses
+PKCE and does not require a Client Secret. Then log in:
 
-~~~bash
+```bash
 spotify-local-migrate login
-spotify-local-migrate playlists
-spotify-local-migrate scan --raw
-~~~
+```
 
-Use `login --no-browser` to open the printed URL yourself, or `login --manual`
-to paste the callback URL into the terminal's hidden prompt on a remote machine.
-Keep callback codes, tokens and secrets out of chat.
+Use `login --no-browser` to open the printed authorization URL yourself, or
+`login --manual` to paste the callback URL on a remote machine. `login --write`
+adds playlist modification permissions when you are ready to apply a migration.
 
-Read scopes: `playlist-read-private`, `playlist-read-collaborative`.
-`login --write` additionally requests `playlist-modify-private` and
-`playlist-modify-public`. It uses the same redirect.
+Request pacing is configured in `.env`:
 
-## Your dxrt scan
-
-There are 344 local occurrences, with uploader/artist prefixes, production
-brackets, exclusives, video credits and features embedded in titles. Album
-metadata is absent; 24 durations are missing. Artist tags often identify
-uploaders/producers. The cleaner learns the dominant artist and explicitly
-labeled producers, extracts collaborations/features from titles, and retains
-all original metadata and removed annotations in the report.
-
-| Local metadata | Prepared title / artists |
-| --- | --- |
-| `2sdxrt3all - oh (prod. whyceg) [djslimebxll exclusive]` | `oh` / `2sdxrt3all` |
-| `v8gve - 2sdxrt3all - cut off my hand [whyceg] ...exclusive...` | `cut off my hand` / `2sdxrt3all` |
-| `2sdxrt3all feat. 2sroccet x 3hard - steppin (Man of da year)` | `steppin (Man of da year)` / all three artists |
-| `2sdxrt3all - push (@wizardpem @whyceg)` | `push` / `2sdxrt3all` |
-
-Unknown annotations are retained. Conflicting versions prevent automatic
-selection. “Long Live Twxn” remains a title. Missing artist/duration evidence
-also disables automatic selection, and unrelated artists are left unmatched.
-
-Real read-only matching on 2026-10-07 saved **188/344** decisions:
-**103 automatic, 15 needing review, 70 unmatched**. Spotify then returned
-Retry-After **85404 seconds**. The remaining matching is unfinished. No playlist
-was modified. The cooldown is persisted; rerunning commands will not resend
-API requests until it expires.
-
-Saved job:
-
-~~~text
-data/6ZIuyhjbuRSbldrD0kJm7m/jobs/20261007T190836Z-4d06c66b
-~~~
-
-During the cooldown, inspect/review saved candidates without API calls:
-
-~~~bash
-spotify-local-migrate status
-spotify-local-migrate review --offline
-~~~
-
-After the cooldown, complete matching, review, and inspect the full plan:
-
-~~~bash
-spotify-local-migrate resume
-spotify-local-migrate review
-spotify-local-migrate migrate --latest --dry-run
-~~~
-
-When you approve that plan:
-
-~~~bash
-spotify-local-migrate login --write
-spotify-local-migrate migrate --latest
-~~~
-
-Unqualified review/resume and `--latest` select the most recently updated job.
-For several playlists, use `--job data/<id>/jobs/<job>`. Apply requires complete
-matching. `review --all` also includes automatic/unmatched decisions.
-
-## Commands
-
-| Command | Behavior |
-| --- | --- |
-| no subcommand | Select and scan a playlist |
-| `login [--write]` | PKCE login; write scopes are opt-in |
-| `playlists [--count-local]` | List playlists and optionally count local tracks |
-| `scan [-p ID] [--raw / --json]` | Save stable metadata and every ordered occurrence |
-| `match [-p ID]` | Fresh scan, searches, ranked candidates and checkpoints |
-| `match --from-scan PATH` | Match a saved scan |
-| `match --job PATH` | Resume matching |
-| `review [--job PATH] [--all] [--offline]` | Approve, reject, inspect scores, search manually |
-| `migrate [--latest / --job PATH / -p ID] --dry-run` | Save a complete operation plan; no mutations |
-| `migrate [--latest / --job PATH / -p ID]` | Match/review/plan, confirm, check compatibility, apply |
-| `resume [--job PATH / -p ID]` | Resume matching or reconcile interrupted apply |
-| `status` | Inspect cached login, scans and jobs locally |
-
-`--no-review` leaves ambiguous decisions unchanged. A completed saved job with
-`migrate --latest --dry-run --no-review` needs no network. `--no-cache` disables
-search response reuse but never bypasses a cooldown. Verbosity precedes the
-command: `spotify-local-migrate -vv match -p ID`.
-
-## Request pacing and automatic cooldowns
-
-Web API attempts start at least **3 seconds** apart, including search, playlist
-reads/writes, pagination and retries. There is **no local daily request cap**.
-The old `SPOTIFY_REQUEST_BUDGET_24H` setting is ignored, including an existing
-value of 400 in `.env`. Usage in `status` is informational.
-
-When Spotify returns HTTP 429, its `Retry-After` is saved to disk and honored in
-full, including a 24-hour wait. The running command prints the resume time,
-updates its countdown every five minutes, and continues automatically after the
-cooldown. Starting another API command during a saved cooldown waits as well.
-Keep the process running; no manual `resume` is needed for a cooldown. Ctrl+C
-stops the command with saved progress, and `resume --job PATH` can continue a
-matching/migration job later. `status` and `review --offline` never wait or make
-API calls.
-
-Short rate limits also double the request interval, up to 60 seconds, with that
-backoff shared across processes and persisted across restarts. A specifically
-identified `QUOTA_EXCEEDED` response uses the server cooldown without treating it
-as a burst limit. Tokens are refreshed after long waits. Before retrying an
-original-playlist write, the executor rechecks the ordered playlist and snapshot;
-external edits stop the migration. Uncertain network/write outcomes still require
-reconciliation, rather than automatic replay.
-
-Settings in `.env` (process environment takes priority):
-
-~~~dotenv
+```dotenv
 SPOTIFY_REQUEST_INTERVAL_SECONDS=3
 SPOTIFY_WAIT_FOR_RATE_LIMITS=true
-~~~
+```
 
-Set `SPOTIFY_WAIT_FOR_RATE_LIMITS=false` only if a command should fail on a
-cooldown instead of waiting. Pacing and usage are shared across jobs and Client
-IDs using the same data directory, persisted in `data/.cache/requests.json` and
-protected by a POSIX process lock. Cached responses seed usage on upgrade;
-cached search hits make no requests. Usage cannot include other applications or
-another data directory.
+Setting `SPOTIFY_WAIT_FOR_RATE_LIMITS=false` makes commands stop on cooldowns
+instead of waiting. Process environment variables override `.env`.
 
-If Spotify supplies no usable reset time, automatic retries use an explicitly
-estimated backoff: one hour initially for quota exhaustion, or one minute for
-other 429s, doubling on repeated missing-reset responses up to 24 hours. This is
-a retry policy, not a claim about Spotify's reset schedule.
+For matching overrides, copy `config.example.yaml` to `config.yaml` and edit
+artist hints, producer names, thresholds, or weights. `match` and `migrate`
+accept `--config PATH` and repeatable `--expected-artist NAME`. Existing jobs
+retain their original matching configuration.
 
-Spotify documents a [rolling 30-second rate limit](https://developer.spotify.com/documentation/web-api/concepts/rate-limits)
-and separate [Development Mode quota buckets](https://developer.spotify.com/documentation/web-api/concepts/quota-modes),
-but does not publish numerical thresholds. Developer reports are inconsistent:
-one [June 2026 report](https://www.reddit.com/r/spotifyapi/comments/1udoj6y/frustrated_by_spotify_api_429_too_many_requests/)
-describes a nearly 24-hour cooldown after roughly 300–500 requests even at one
-request per six seconds. That report is anecdotal and involves different endpoint
-usage; it is not a known search quota. The application follows Spotify's actual
-responses rather than assuming a universal request allowance.
+## Usage
 
-## Matching settings
+Select a playlist, match its local tracks, review the results, and inspect the
+plan before applying:
 
-Copy `config.example.yaml` to `config.yaml` for explicit playlist artist hints,
-additional producer names, thresholds or weights. Use `--config PATH` or repeat
-`--expected-artist NAME` with match/migrate. Existing jobs retain their original
-configuration.
+```bash
+spotify-local-migrate match
+spotify-local-migrate review
+spotify-local-migrate migrate --latest --dry-run
+spotify-local-migrate login --write
+spotify-local-migrate migrate --latest
+```
 
-Default weights: title 50%, artist 30%, duration 15%, album 5%. Missing fields
-redistribute weight, with conservative automatic-selection gates. Duration is
-essentially identical within 2 seconds, strong within 5, progressively worse
-at 5–30, and heavily penalized beyond 30. Scores are heuristics, not probabilities.
+Apply displays the plan and asks for confirmation before writing. Ambiguous
+matches can be approved, searched manually, or left unchanged.
 
-Defaults: automatic >=0.90, review >=0.70, with a >=0.05 margin over other
-recordings. Automatic selection also needs strong title/all artist evidence,
-account playability, duration within 10 seconds, and consistent versions.
-Equivalent album releases appear as one review choice. Prefer a playable explicit
-version over its non-explicit counterpart; among equivalent releases with the same
-content rating, keep Spotify's first search result. Album duplicates require a
-shared ISRC, matching title/version and artists, and duration within 2 seconds.
-Clean/explicit counterparts may have different ISRCs, but must have known opposite
-explicit flags and the same title/version, artists and duration within 2 seconds.
-Different recordings with unknown ISRCs remain ambiguous. Alternate releases are
-retained in the saved report and shown under **Show scores**. These preferences
-also apply to manual searches and saved jobs; completed human choices are preserved.
+To select another playlist directly:
 
-Queries broaden from title+artist filters to free text and title-only searches.
-All query variants are gathered before ranking ambiguity. SQLite cache keys
-include account, market, query and page.
+```bash
+spotify-local-migrate playlists
+spotify-local-migrate match -p PLAYLIST_ID
+```
 
-## Apply and recovery
+`-p` accepts a 22-character playlist ID, Spotify playlist URI, or playlist URL.
+Playlist list numbers are only accepted at the interactive selection prompt.
 
-Replacements preserve each original occurrence, including intentional duplicates.
-The plan explains existing catalogue occurrences and repeated replacements.
-Nothing is silently deduplicated.
+`review`, `resume`, and `migrate --latest` use the most recently updated job.
+Use `--job PATH` to select a specific saved job:
 
-Work from bottom to top. Insert a catalogue track directly before the local
-occurrence, persist its returned snapshot, verify the whole playlist, then remove
-that exact shifted local occurrence using position and verified snapshot. Every
-mutation has a saved intent before dispatch and verification afterwards.
-Unmatched locals, episodes and null/unavailable entries retain order.
+```bash
+spotify-local-migrate status
+spotify-local-migrate resume --job data/PLAYLIST_ID/jobs/JOB_ID
+spotify-local-migrate review --offline --job data/PLAYLIST_ID/jobs/JOB_ID
+```
 
-**Spotify's positional removal schema is incomplete.** The playlist guide
-requires index + snapshot for locals, while the current DELETE reference
-documents URI-based items. The inferred position-only payload is tested on a
-new private catalogue-only playlist first: single-occurrence removal, duplicate
-preservation, stale retries, and positions shifted after a snapshot. Failure
-stops before any original-playlist mutation. There is no local-URI deletion or
-whole-playlist rewrite fallback. Live local removal has not yet been validated
-with your write-authorized account.
+Keep a running command open to continue automatically after a cooldown. If
+interrupted, `resume` continues matching or reconciles migration progress.
+For an uncertain write, inspect Spotify before using `--retry-unconfirmed`
+(insertion) or `--retry-unconfirmed-delete` (deletion); both require confirmation.
 
-The test playlist is removed from your library after the check. Cleanup failure
-is reported and saved in `probe.json`. A lost creation response can leave a
-temporary playlist without a returned ID; locate it by its saved “Local migrator
-API check …” name.
+| Command or option | Purpose |
+| --- | --- |
+| `scan [-p ID] [--raw]` | Capture a playlist and inspect local metadata |
+| `scan -p ID --json` | Print the complete capture as JSON |
+| `match --from-scan PATH` | Match an existing capture |
+| `review --all` | Include automatic and unmatched decisions |
+| `review --offline` | Review saved candidates without API calls |
+| `migrate --no-review` | Leave ambiguous matches unchanged |
+| `status` | Show saved jobs, login state, and request usage without API calls |
+| `--help` | Show commands and options; also available on each command |
 
-After an interrupted apply:
-
-~~~bash
-spotify-local-migrate resume
-~~~
-
-Resume compares actual ordered state with saved before/after states and
-reconciles committed requests. It never blindly repeats an unconfirmed insertion.
-If that insertion still appears absent, stop, wait and inspect Spotify.
-`resume --retry-unconfirmed` then offers another default-No confirmation. An
-earlier request might still commit later, creating an extra occurrence.
-
-Unexpected external edits stop further writes. Avoid concurrent editing while
-applying: snapshots are not a global transaction lock. JSON captures support
-inspection/reconciliation, but cannot restore deleted locals through the API.
-Keep the original audio and job files until satisfied with verification.
-
-## Project and validation
-
-~~~text
-spotify-local-migrator/
-├── README.md, DESIGN.md, pyproject.toml, config.example.yaml
-├── src/spotify_local_migrator/
-│   ├── cli.py, config.py, models.py, workflow.py
-│   ├── spotify/       # PKCE, 2026 API, retries, durable cooldown
-│   ├── matching/      # cleanup, search cache, scoring, checkpoints
-│   ├── migration/     # scanner, jobs, planner, executor, atomic state
-│   └── ui/            # inspection and review
-└── tests/
-~~~
-
-Each job has `original.json`, `matches.json`, `plan.json`, then `probe.json` and
-`migration.json` when applying. Captures also remain under `data/<id>/scans/`;
-the first `data/<id>/original.json` is never overwritten. Files are atomically
-written/fsynced with mode 0600. Back up whole job directories. Apply locking
-currently requires POSIX (Linux/macOS).
-
-~~~bash
-python -m pytest -q
-ruff check .
-ruff format --check .
-python -m pip check
-~~~
-
-Tests mock Spotify, including real metadata formats, version conflicts,
-confidence, missing evidence, pagination, duplicates, positional snapshots,
-OAuth refresh, 429 cooldowns, crashes, unknown outcomes, external edits, process
-locks and default-No confirmation.
-
-See [DESIGN.md](DESIGN.md) for API sources, algorithm rationale and live
-validation limits.
+Use `--no-cache` on match/review/migrate/resume to bypass cached search results.
+For verbose logs, place verbosity before the command:
+`spotify-local-migrate -vv match -p PLAYLIST_ID`.

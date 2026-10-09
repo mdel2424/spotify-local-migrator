@@ -1,4 +1,4 @@
-"""User-facing errors deliberately omit HTTP bodies, URLs and tokens."""
+"""User-facing errors omit raw HTTP bodies, URLs and tokens."""
 
 
 class MigratorError(Exception):
@@ -14,9 +14,18 @@ class AuthenticationError(MigratorError):
 
 
 class SpotifyAPIError(MigratorError):
-    def __init__(self, message: str, status_code: int | None = None):
+    def __init__(
+        self,
+        message: str,
+        status_code: int | None = None,
+        *,
+        api_message: str | None = None,
+        reason: str | None = None,
+    ):
         super().__init__(message)
         self.status_code = status_code
+        self.api_message = api_message
+        self.reason = reason
 
 
 class RateLimitError(SpotifyAPIError):

@@ -15,6 +15,15 @@ from .rate_limits import CooldownStore
 API_ROOT = "https://api.spotify.com/v1"
 
 
+def error_detail(body: dict[str, Any]) -> tuple[str, str | None, str | None]:
+    error = body.get("error", {})
+    message, reason = error.get("message"), error.get("reason")
+    detail = f" Spotify: {message}." if message else ""
+    if reason:
+        detail += f" Reason: {reason}."
+    return detail, message, reason
+
+
 class SpotifyClient:
     """2026 Web API adapter; writes require explicit OAuth scopes."""
 
@@ -117,11 +126,14 @@ class SpotifyClient:
                     "Spotify rejected refreshed authentication. Run login again."
                 )
             if status == 403:
+                detail, api_message, reason = error_detail(body)
                 raise SpotifyAPIError(
                     "Spotify denied access (HTTP 403). Playlist items require ownership or "
                     "actual collaborator access. Also check the app's user allowlist, "
-                    "Premium app owner and read scopes.",
+                    "Premium app owner and read scopes." + detail,
                     status_code=403,
+                    api_message=api_message,
+                    reason=reason,
                 )
             if not 200 <= status < 300:
                 raise SpotifyAPIError(
@@ -225,10 +237,20 @@ class SpotifyClient:
                 token = self.auth.access_token(force_refresh=True)
                 continue
             if not 200 <= status < 300:
+                detail, api_message, reason = error_detail(body)
                 raise SpotifyAPIError(
-                    f"Spotify {method} failed (HTTP {status}). "
-                    "Progress is saved; use resume after resolving access.",
+                    f"Spotify {method} {endpoint} failed (HTTP {status})."
+                    + detail
+                    + " "
+                    + (
+                        "Check Spotify permissions, app access and account restrictions. "
+                        if status == 403
+                        else ""
+                    )
+                    + "The request was not automatically repeated.",
                     status_code=status,
+                    api_message=api_message,
+                    reason=reason,
                 )
             return body
         raise AssertionError("Unreachable authentication state")

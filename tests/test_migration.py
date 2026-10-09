@@ -266,9 +266,7 @@ def test_apply_preserves_exact_order_and_occurrence_count(job):
     assert len(api.calls) == calls_before  # Completed resume has no mutations.
 
 
-@pytest.mark.parametrize(
-    "mode", ["reject", "no-op", "all-duplicates", "shift", "idempotent-but-current-position"]
-)
+@pytest.mark.parametrize("mode", ["reject", "no-op", "all-duplicates"])
 def test_incompatible_removal_api_never_touches_original(job, mode):
     store, _, _, plan = job
     execution, api = executor(job)
@@ -310,13 +308,16 @@ def test_unconfirmed_uncommitted_add_stops_until_explicit_retry(job):
     assert identities(api.scan(api.original_id)) == plan.desired
 
 
-def test_unconfirmed_uncommitted_delete_retries_same_snapshot(job):
+def test_unconfirmed_uncommitted_delete_stops_until_explicit_retry(job):
     store, _, _, plan = job
     execution, api = executor(job)
     api.fail_before = "delete"
     with pytest.raises(SpotifyAPIError):
         execution.apply(store)
-    execution.apply(store)
+    with pytest.raises(StateError, match="No deletion was replayed"):
+        execution.apply(store)
+    assert len(original_calls(api, "delete")) == 1
+    execution.apply(store, retry_unconfirmed_delete=True)
     deletes = original_calls(api, "delete")
     assert deletes[0][3] == deletes[1][3]
     assert len(original_calls(api, "add")) == 3
@@ -437,6 +438,99 @@ def test_response_acknowledgement_must_match_verified_snapshot(job):
         execution.apply(store)
     assert len(original_calls(api, "add")) == 1
     assert not original_calls(api, "delete")
+
+
+def test_probe_chains_mutation_snapshots_when_playlist_reads_return_stale_version(job, monkeypatch):
+    store, _, _, plan = job
+    execution, api = executor(job)
+    scan = api.scan
+
+    def stale_read_version(playlist_id):
+        capture = scan(playlist_id)
+        if playlist_id == P:
+            capture.snapshot_id = "creation-version"
+        return capture
+
+    monkeypatch.setattr(api, "scan", stale_read_version)
+    execution.preflight(store, plan)
+    probe = json.loads((store.directory / "probe.json").read_text())
+    assert probe["phase"] == "PASSED"
+    assert all(item["sequence_matches"] for item in probe["observations"])
+    insertions = [item for item in probe["observations"] if "acknowledged_snapshot" in item]
+    assert all(not item["snapshot_matches_acknowledgment"] for item in insertions)
+    assert api.calls[2][3] == probe["observations"][0]["acknowledged_snapshot"]
+    assert all(call[3] != "creation-version" for call in api.calls if call[0] == "delete")
+    assert not original_calls(api)
+
+
+@pytest.mark.parametrize("mode", ["shift", "idempotent-but-current-position"])
+def test_current_position_api_preserves_duplicates_without_old_snapshot_replay(job, mode):
+    store, _, _, plan = job
+    execution, api = executor(job)
+    api.position_mode = mode
+    execution.apply(store)
+    probe = json.loads((store.directory / "probe.json").read_text())
+    assert probe["strategy"] == "verified_current_positions"
+    assert probe["checks"] == {"single_occurrence": True, "nonzero_position": True}
+    assert probe["phase"] == "PASSED"
+    assert all(item["sequence_matches"] for item in probe["observations"])
+    assert probe["observations"][-1]["stage"] == "nonzero-position removal"
+    probe_deletes = [call for call in api.calls if call[0] == "delete" and call[1] == P]
+    assert [call[2] for call in probe_deletes] == [[0], [1]]
+    assert len({call[3] for call in probe_deletes}) == 2
+    assert probe["removed_from_library"]
+    assert identities(api.scan(api.original_id)) == plan.desired
+    assert len(original_calls(api, "delete")) == len(plan.replacements)
+
+
+def test_probe_retries_stale_reads_without_repeating_insertion(job, monkeypatch):
+    store, _, _, plan = job
+    execution, api = executor(job)
+    scan = api.scan
+    stale = True
+
+    def delayed_visibility(playlist_id):
+        nonlocal stale
+        capture = scan(playlist_id)
+        if playlist_id == P and stale:
+            stale = False
+            capture.entries = []
+            capture.snapshot_id = "empty"
+        return capture
+
+    monkeypatch.setattr(api, "scan", delayed_visibility)
+    execution.preflight(store, plan)
+    probe = json.loads((store.directory / "probe.json").read_text())
+    assert probe["phase"] == "PASSED"
+    assert probe["observations"][0]["observed_uris"] == []
+    assert probe["observations"][1]["sequence_matches"]
+    assert len([call for call in api.calls if call[0] == "add"]) == 2  # initial and shift test
+    assert not original_calls(api)
+
+
+def test_probe_wrong_order_records_diagnostics_and_never_deletes(job, monkeypatch):
+    store, _, _, plan = job
+    execution, api = executor(job)
+    scan = api.scan
+
+    def wrong_order(playlist_id):
+        capture = scan(playlist_id)
+        if playlist_id == P:
+            capture.entries[0], capture.entries[1] = capture.entries[1], capture.entries[0]
+        return capture
+
+    monkeypatch.setattr(api, "scan", wrong_order)
+    with pytest.raises(StateError, match="could not be verified after 3 reads"):
+        execution.preflight(store, plan)
+    probe = json.loads((store.directory / "probe.json").read_text())
+    assert probe["phase"] == "FAILED"
+    assert len(probe["observations"]) == 3
+    assert all(item["observed_uris"] != item["expected_uris"] for item in probe["observations"])
+    assert all(not item["sequence_matches"] for item in probe["observations"])
+    assert not any(call[0] == "delete" for call in api.calls)
+    assert len([call for call in api.calls if call[0] == "add"]) == 1
+    assert api.removed_probe
+    assert not original_calls(api)
 
 
 def test_external_edit_before_apply_prevents_all_writes(job):

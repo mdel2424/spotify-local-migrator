@@ -4,7 +4,9 @@ Official documentation checked on 2026-10-07. Real-account scanner validation
 covered the 344-item dxrt playlist. Real read-only matching checkpointed 188
 occurrences before a 429 cooldown. This fulfilled the scanner/matcher gate
 before mutation code was implemented. No live playlist mutations have occurred
-during development.
+during development of the scanner/matcher. Subsequent live catalogue-only
+compatibility tests verified single and nonzero current-position removal;
+original-playlist local removal remains subject to runtime verification.
 
 ## 2026 API contracts
 
@@ -104,16 +106,37 @@ Unselected occurrences remain local.
 Before the first original-playlist write, after explicit default-No confirmation:
 
 1. Create a private playlist, add distinct playable catalogue tracks `[A,B,A]`,
-   and verify order/snapshot.
+   and verify exact order; record both response and readback snapshots.
 2. Use the inferred position-only DELETE at 0 against its snapshot. Require
    `[B,A]`; detect no-ops and URI-wide duplicate deletion.
-3. Repeat that DELETE with the old snapshot. Require unchanged `[B,A]`, including
-   after an explicit stale-snapshot rejection.
-4. Capture the snapshot, insert A at 0, verify `[A,B,A]`. Delete old-snapshot
-   position 0 (which refers to B). Require `[A,A]` if snapshots merge, or unchanged
-   `[A,B,A]` if stale snapshots are rejected. This detects retry deduplication
-   that still applies stale indexes to current positions.
-5. Save results and remove the temporary playlist from the user's library.
+3. Insert A at 0, verify `[A,B,A]`, and delete current position 1 against the
+   insertion response snapshot. Require `[A,A]`, proving nonzero-position removal.
+4. Save the `verified_current_positions` strategy, capabilities and snapshot
+   read reliability, then remove the temporary playlist from the user's library.
+
+Do not require idempotent stale-snapshot removal: the live endpoint has been
+observed applying a repeated DELETE to the current index and deleting the next
+track. Migration therefore sends each delete once, compares complete sequences
+before/after, and never automatically replays an uncertain deletion. A stale
+read snapshot is not a version anchor: journal mutation response snapshots
+separately, use the last one for deletion when available, and retain observed read
+snapshots for external-change checks. If the probe reports unreliable reads,
+accept snapshot catch-up or cache regression only to a version recorded in this
+original playlist's journal, alongside an exact full sequence match. Load that
+policy before validating progress on resume. Refresh the observed read version
+without changing completed operations or the last mutation version. Apply the
+same policy to an unchanged pending-before state, retaining the prohibition on
+automatic replay. Unknown versions and changed sequences still stop execution.
+If the probe reports reliable snapshots, require exact saved-version and mutation
+acknowledgment/readback agreement.
+
+Persist successful proof in a separate `compatibility.json`, binding account,
+Client ID, capture/matches hashes, strategy version and UTC test time. Reuse
+for at most 24 hours before a new apply; started jobs may resume using their
+bound proof after expiry. Never overwrite successful proof on a failed attempt.
+Preserve the latest attempt and separate cleanup errors in `probe.json`. Surface
+only sanitized structured API error message/reason fields; discard other body
+fields and redact credentials/URLs. A 403 is a denial, not a presumed cooldown.
 
 Failure leaves the original untouched. This proves catalogue positional
 semantics, not local-file support. A later rejected local removal leaves its
@@ -160,10 +183,12 @@ request's intent for later retry after resolving access/rate limits.
 Resume validates account, capture/report/plan hashes and journal projections,
 then compares actual ordered state with exact pending before/after sequences.
 A consistent after state reconciles a committed request even after a crash
-before local acknowledgement. Pending DELETE retries retain the original
-verified snapshot after stale-retry compatibility testing. An unconfirmed absent
-insertion stops; retry needs explicit additional default-No confirmation because
-an earlier request may still be in flight. Other changes halt further writes.
+before local acknowledgement. An uncertain operation still showing the before
+state stops without replay. Explicit additional default-No confirmation is
+required to retry an absent insertion (`--retry-unconfirmed`) or an unchanged
+deletion (`--retry-unconfirmed-delete`), after waiting and inspecting that it did
+not commit. A late request could otherwise add a duplicate or delete another
+occurrence. Other changes halt further writes.
 
 POSIX locks cover the job and all apply jobs for one playlist. Recompute
 journal expectations from the plan to detect invalid progress/pending state.

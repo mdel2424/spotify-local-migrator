@@ -46,6 +46,7 @@ class JobStore:
             "plan.json",
             "migration.json",
             "probe.json",
+            "compatibility.json",
         }:
             raise StateError("Invalid migration state filename.")
         try:

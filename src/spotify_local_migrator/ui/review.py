@@ -201,3 +201,8 @@ def show_plan(console: Console, plan: MigrationPlan) -> None:
             "position removal and snapshot behavior, then removes it from your library. "
             "If verification fails, your original playlist stays untouched."
         )
+        console.print(
+            "Keep playlist editing paused until migration finishes. "
+            "Each positional deletion is verified and sent once; simultaneous edits "
+            "can move its target before Spotify processes it."
+        )
