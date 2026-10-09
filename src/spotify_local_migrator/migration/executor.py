@@ -5,6 +5,7 @@ Spotify snapshots merge edits; full sequence comparison is therefore mandatory.
 """
 
 import json
+import time
 from collections.abc import Callable
 from contextlib import contextmanager
 from datetime import UTC, datetime
@@ -20,6 +21,8 @@ from ..workflow import account_id
 from .jobs import JobStore, content_hash
 from .planner import EntryIdentity, MigrationPlan, identities
 from .scanner import PlaylistScanner
+
+MAX_CAPTURE_AGE_SECONDS = 10.0
 
 
 class PendingOperation(BaseModel):
@@ -167,10 +170,12 @@ class MigrationExecutor:
         *,
         scanner: PlaylistScanner | None = None,
         progress: Callable[[str], None] | None = None,
+        clock: Callable[[], float] = time.monotonic,
     ):
         self.client = client
         self.scanner = scanner or PlaylistScanner(client)
         self.progress = progress or (lambda message: None)
+        self.clock = clock
 
     def _capture(self, playlist_id: str):
         return self.scanner.scan(playlist_id)
@@ -503,6 +508,8 @@ class MigrationExecutor:
             )
             reliable_snapshots = proof is None or proof.get("snapshot_reads_reliable", True) is True
             current = self._capture(plan.playlist_id)
+            captured_at = self.clock()
+            capture_generation = self.client.cooldown_generation
             if not journal.pending and (
                 identities(current) != journal.current
                 or not snapshot_matches(
@@ -522,6 +529,8 @@ class MigrationExecutor:
                 # isolated positional compatibility check passes.
                 self.preflight(store, plan)
                 current = self._capture(plan.playlist_id)
+                captured_at = self.clock()
+                capture_generation = self.client.cooldown_generation
                 if identities(current) != plan.original or current.snapshot_id != plan.snapshot_id:
                     raise PlaylistChangedError(
                         "Playlist changed during compatibility check; start a new plan."
@@ -531,10 +540,21 @@ class MigrationExecutor:
                 proof = self._compatibility_record(store, plan)
             reliable_snapshots = proof.get("snapshot_reads_reliable", True) is True
 
+            capture_needed = False
             while True:
                 validate_journal(plan, journal)
-                current = self._capture(plan.playlist_id)
-                cooldown_generation = self.client.cooldown_generation
+                if (
+                    capture_needed
+                    or self.clock() - captured_at >= MAX_CAPTURE_AGE_SECONDS
+                    or self.client.cooldown_generation != capture_generation
+                ):
+                    current = self._capture(plan.playlist_id)
+                    captured_at = self.clock()
+                    capture_generation = self.client.cooldown_generation
+                    capture_needed = False
+                # A post-write capture is also the next operation's pre-write
+                # verification. Reuse it only briefly within this invocation;
+                # every dispatch, cooldown and resume requires a fresh read.
                 actual = identities(current)
                 pending = journal.pending
                 if pending:
@@ -571,11 +591,12 @@ class MigrationExecutor:
                         else:
                             journal.stage = "ready"
                             journal.next_replacement += 1
+                        save_journal(store, journal)
+                        if pending.kind == "delete":
                             self.progress(
                                 f"Verified replacement {journal.next_replacement}"
                                 f"/{len(plan.replacements)}"
                             )
-                        save_journal(store, journal)
                         continue
                     if actual != pending.before or not snapshot_matches(
                         journal,
@@ -612,6 +633,7 @@ class MigrationExecutor:
                             )
                         retry_unconfirmed_delete = False
                     self._dispatch(store, plan, journal)
+                    capture_needed = True
                     continue
 
                 if actual != journal.current or not snapshot_matches(
@@ -633,9 +655,10 @@ class MigrationExecutor:
                 after = [entry.model_copy() for entry in journal.current]
                 if journal.stage == "ready":
                     candidate = candidate_from_api(self.client.track(replacement.spotify_id))
-                    if self.client.cooldown_generation != cooldown_generation:
+                    if self.client.cooldown_generation != capture_generation:
                         # A track lookup can also pause for hours. Discard this
                         # pre-wait playlist verification and scan again.
+                        capture_needed = True
                         continue
                     if (
                         candidate is None
@@ -675,6 +698,7 @@ class MigrationExecutor:
                 )
                 save_journal(store, journal)  # Durable intent BEFORE dispatch.
                 self._dispatch(store, plan, journal)
+                capture_needed = True
 
     def _dispatch(self, store: JobStore, plan: MigrationPlan, journal: MigrationJournal) -> None:
         pending = journal.pending

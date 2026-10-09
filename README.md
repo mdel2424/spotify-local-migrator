@@ -30,7 +30,10 @@ Manual choices remain saved.
 
 Migration works from the bottom of the playlist upward. It inserts a replacement
 before its local occurrence, verifies the complete sequence, removes the shifted
-local by position, and verifies again. A temporary private playlist checks
+local by position, and verifies again. A fresh post-write verification also serves
+as the next operation's pre-write check, avoiding duplicate full scans. Reads are
+repeated after a cooldown, resume, or a delay of at least 10 seconds.
+A temporary private playlist checks
 positional removal before the original is changed. Successful checks are reused
 for 24 hours for the same account, app, and unchanged job. Delayed snapshot reads
 are reconciled against recorded mutation versions and exact track order.

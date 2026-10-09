@@ -45,23 +45,15 @@ def saved_progress(store):
 def pause_after_two_replacements(job, monkeypatch):
     store, _, _, _ = job
     execution, api = live_behavior(job, monkeypatch)
-    scan = api.scan
 
-    def interrupted_scan(playlist_id):
-        state = saved_progress(store)
-        if (
-            playlist_id == api.original_id
-            and state
-            and state["next_replacement"] == 2
-            and state["pending"] is None
-        ):
-            raise SpotifyAPIError("scan interrupted after two verified replacements")
-        return scan(playlist_id)
+    def interrupted_progress(message):
+        if message.startswith("Verified replacement 2/"):
+            raise SpotifyAPIError("interrupted after two verified replacements")
 
-    monkeypatch.setattr(api, "scan", interrupted_scan)
-    with pytest.raises(SpotifyAPIError, match="scan interrupted"):
+    monkeypatch.setattr(execution, "progress", interrupted_progress)
+    with pytest.raises(SpotifyAPIError, match="interrupted after two"):
         execution.apply(store)
-    monkeypatch.setattr(api, "scan", scan)
+    monkeypatch.setattr(execution, "progress", lambda message: None)
     assert saved_progress(store)["next_replacement"] == 2
     return execution, api
 
