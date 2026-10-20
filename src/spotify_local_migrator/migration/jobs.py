@@ -91,9 +91,25 @@ class JobStore:
             os.close(descriptor)
 
 
-def latest_job(data_dir: Path, playlist_id: str | None = None) -> JobStore:
+def latest_job(
+    data_dir: Path, playlist_id: str | None = None, *, operation: str | None = None
+) -> JobStore:
     pattern = (validate_playlist_id(playlist_id) if playlist_id else "*") + "/jobs/*/matches.json"
     candidates = list(data_dir.glob(pattern))
+    if operation:
+        selected = []
+        for file in candidates:
+            try:
+                if (
+                    json.loads(file.read_text(encoding="utf-8")).get("operation", "migrate")
+                    == operation
+                ):
+                    selected.append(file)
+            except (OSError, ValueError, AttributeError):
+                continue
+        candidates = selected
     if not candidates:
+        if operation == "cleanup":
+            raise StateError("No cleanup jobs found. Run cleanup --dry-run first.")
         raise StateError("No matching jobs found. Run match or migrate --dry-run first.")
     return JobStore(max(candidates, key=lambda file: file.stat().st_mtime_ns).parent)

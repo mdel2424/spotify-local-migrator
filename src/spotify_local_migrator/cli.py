@@ -69,12 +69,14 @@ def parse_playlist_argument(value: str) -> str:
     return validate_playlist_id(value)
 
 
-def select_playlist(client: SpotifyClient) -> str:
+def select_playlist(client: SpotifyClient, data_dir: Path) -> str:
     console.print("Fetching playlists...")
     playlists = [playlist_summary(raw) for raw in client.playlists()]
     if not playlists:
         raise MigratorError("No playlists were returned for this account.")
-    show_playlists(console, playlists)
+    counts = CaptureStore(data_dir).local_counts(playlist.playlist_id for playlist in playlists)
+    show_playlists(console, playlists, counts)
+    console.print("Local counts reflect the latest saved scan.")
     console.print("Item access requires ownership or actual collaborator access.")
     while True:
         choice = IntPrompt.ask("Select playlist")
@@ -91,7 +93,11 @@ def perform_scan(
     if json_output and raw:
         raise typer.BadParameter("--raw and --json cannot be combined.")
     with services(settings) as (_, client):
-        playlist_id = parse_playlist_argument(playlist) if playlist else select_playlist(client)
+        playlist_id = (
+            parse_playlist_argument(playlist)
+            if playlist
+            else select_playlist(client, settings.data_dir)
+        )
         output = error_console if json_output else console
         output.print("Scanning playlist (read-only)...")
         capture = PlaylistScanner(client, attempts=settings.scan_attempts).scan(playlist_id)
@@ -183,13 +189,15 @@ def playlists(
     with services(ctx.obj) as (_, client):
         console.print("Fetching playlists...")
         summaries = [playlist_summary(raw) for raw in client.playlists()]
-        counts: dict[str, str] = {}
+        captures = CaptureStore(ctx.obj.data_dir)
+        counts = captures.local_counts(summary.playlist_id for summary in summaries)
         if count_local:
             for summary in summaries:
                 try:
                     capture = PlaylistScanner(client, attempts=ctx.obj.scan_attempts).scan(
                         summary.playlist_id
                     )
+                    captures.save(capture)
                     counts[summary.playlist_id] = str(len(capture.local_tracks))
                     summary.item_count = len(capture.entries)
                 except SpotifyAPIError as exc:
@@ -201,7 +209,8 @@ def playlists(
             console.print("No playlists returned.")
         if not count_local:
             console.print(
-                "Use playlists --count-local to read each playlist and count local entries."
+                "Local counts reflect the latest saved scan. "
+                "Use playlists --count-local to refresh and save them."
             )
 
 
@@ -328,7 +337,7 @@ def match(
         playlist_id = (
             parse_playlist_argument(playlist)
             if playlist
-            else select_playlist(client)
+            else select_playlist(client, ctx.obj.data_dir)
             if not from_scan and not job
             else None
         )
@@ -358,6 +367,11 @@ def perform_review(settings, client, store, all_tracks=False, no_cache=False):
         raise MigratorError("Matching is incomplete. Run match --job for this job.")
     if account_id(client) != report.account_id:
         raise MigratorError("Job belongs to a different Spotify account.")
+    if report.operation == "cleanup":
+        with store.lock():
+            report = review_report(console, store, report, None, all_tracks=all_tracks)
+        show_results(console, report)
+        return
     config = MatchingConfig.model_validate(report.matching_config)
     with (
         store.lock(),
@@ -440,12 +454,20 @@ def migrate(
     if sum(bool(value) for value in (job, playlist, latest)) > 1:
         raise typer.BadParameter("Choose --job, --latest or --playlist.")
     store = selected_job(ctx.obj, job) if job or latest else None
+    if store and store.report().operation == "cleanup":
+        raise MigratorError(
+            "This is a cleanup job. Use cleanup --job, or resume after apply starts."
+        )
     if store and (store.directory / "migration.json").exists():
         raise MigratorError("Apply already started for this job. Use resume.")
     if store is None or not store.report().matching_complete or expected_artist:
         with services(ctx.obj) as (_, client):
             playlist_id = (
-                (parse_playlist_argument(playlist) if playlist else select_playlist(client))
+                (
+                    parse_playlist_argument(playlist)
+                    if playlist
+                    else select_playlist(client, ctx.obj.data_dir)
+                )
                 if store is None
                 else None
             )
@@ -492,6 +514,113 @@ def migrate(
 
 @app.command()
 @user_errors
+def cleanup(
+    ctx: typer.Context,
+    playlist: Annotated[str | None, typer.Option("--playlist", "-p")] = None,
+    job: Annotated[Path | None, typer.Option("--job")] = None,
+    latest: Annotated[
+        bool, typer.Option("--latest", help="Use the latest saved cleanup job.")
+    ] = False,
+    from_scan: Annotated[Path | None, typer.Option("--from-scan")] = None,
+    dry_run: Annotated[
+        bool, typer.Option("--dry-run", help="Save a deletion plan without writing or reviewing.")
+    ] = False,
+    no_review: Annotated[
+        bool, typer.Option("--no-review", help="Keep uncertain local copies.")
+    ] = False,
+    config: Annotated[Path, typer.Option("--config")] = Path("config.yaml"),
+    expected_artist: Annotated[
+        list[str] | None, typer.Option("--artist", "--expected-artist")
+    ] = None,
+) -> None:
+    """Remove local copies whose Spotify counterparts already exist in the playlist."""
+    from rich.prompt import Confirm
+
+    from .matching.cleanup import refresh_cleanup_choices
+    from .migration.executor import MigrationExecutor
+    from .migration.jobs import latest_job
+    from .migration.planner import build_plan
+    from .ui.review import review_report, show_plan, show_results
+    from .workflow import cleanup_job
+
+    if sum(bool(value) for value in (playlist, job, latest, from_scan)) > 1:
+        raise typer.BadParameter("Choose --playlist, --job, --latest or --from-scan.")
+    store = (
+        latest_job(ctx.obj.data_dir, operation="cleanup")
+        if latest
+        else selected_job(ctx.obj, job)
+        if job
+        else None
+    )
+    if store:
+        if store.report().operation != "cleanup":
+            raise MigratorError(
+                "This is a migration job. Start cleanup from a fresh playlist scan."
+            )
+        if (store.directory / "migration.json").exists():
+            raise MigratorError("Cleanup already started. Use resume for this job.")
+    if store is None or not dry_run or expected_artist:
+        with services(ctx.obj) as (_, client):
+            playlist_id = (
+                None
+                if store or from_scan
+                else (
+                    parse_playlist_argument(playlist)
+                    if playlist
+                    else select_playlist(client, ctx.obj.data_dir)
+                )
+            )
+            store = cleanup_job(
+                ctx.obj,
+                client,
+                console,
+                store=store,
+                playlist_id=playlist_id,
+                from_scan=from_scan,
+                config_path=config,
+                expected_artists=expected_artist,
+            )
+    with store.lock():
+        report = store.report()
+        if refresh_cleanup_choices(report, store.capture()):
+            store.save("matches.json", report)
+        if not dry_run and not no_review and any(d.needs_review for d in report.decisions):
+            if Confirm.ask("Review uncertain local/Spotify pairs?", default=True):
+                report = review_report(console, store, report, None)
+                show_results(console, report)
+        plan = build_plan(store.capture(), report)
+        store.save("plan.json", plan)
+    show_plan(console, plan)
+    console.print(Text(f"Complete cleanup plan saved: {store.directory / 'plan.json'}"))
+    if dry_run:
+        console.print(
+            Text(
+                "Review saved pairs: spotify-local-migrate review --offline "
+                f"--job {store.directory}"
+            )
+        )
+        console.print(
+            Text(f"Apply this job: spotify-local-migrate cleanup --job {store.directory}")
+        )
+        console.print("Dry run complete. No Spotify mutations.")
+        return
+    if not plan.replacements:
+        console.print("No local duplicates selected. Playlist unchanged.")
+        return
+    if not Confirm.ask(
+        "Remove these local copies, including the temporary API check?", default=False
+    ):
+        console.print("Cleanup plan saved. Playlist unchanged.")
+        return
+    with services(ctx.obj) as (_, client):
+        result = MigrationExecutor(
+            client, progress=lambda message: console.print(Text(message))
+        ).apply(store)
+    console.print(f"{result.phase}: {result.next_replacement} local copies removed and verified.")
+
+
+@app.command()
+@user_errors
 def resume(
     ctx: typer.Context,
     job: Annotated[Path | None, typer.Option("--job")] = None,
@@ -519,6 +648,15 @@ def resume(
 
     store = selected_job(ctx.obj, job, playlist)
     if not (store.directory / "migration.json").exists():
+        if store.report().operation == "cleanup":
+            from .workflow import cleanup_job
+
+            with services(ctx.obj) as (_, client):
+                cleanup_job(ctx.obj, client, console, store=store)
+            console.print(
+                Text(f"Cleanup ready. Next: spotify-local-migrate cleanup --job {store.directory}")
+            )
+            return
         with services(ctx.obj) as (_, client):
             match_job(ctx.obj, client, console, store=store, no_cache=no_cache)
         console.print(Text(f"Matching complete. Next: migrate --dry-run --job {store.directory}"))
@@ -545,7 +683,8 @@ def resume(
             retry_unconfirmed_add=retry_unconfirmed,
             retry_unconfirmed_delete=retry_unconfirmed_delete,
         )
-    console.print(f"{result.phase}: {result.next_replacement} replacements verified.")
+    label = "local removals" if store.report().operation == "cleanup" else "replacements"
+    console.print(f"{result.phase}: {result.next_replacement} {label} verified.")
 
 
 def show_job_status(settings: Settings) -> None:
@@ -567,12 +706,16 @@ def show_job_status(settings: Settings) -> None:
                     f"MATCH partial ({len(report.decisions)}/{len(store.capture().local_tracks)})"
                 )
             )
+            if report.operation == "cleanup":
+                state = "CLEANUP ready" if report.matching_complete else "CLEANUP partial"
             journal_path = file.parent / "migration.json"
             if journal_path.exists():
                 journal = json.loads(journal_path.read_text(encoding="utf-8"))
                 state = f"{journal['phase']} ({journal['next_replacement']} verified)"
                 if journal.get("pending"):
                     state += " pending " + journal["pending"]["kind"]
+                if report.operation == "cleanup":
+                    state = "CLEANUP " + state
             table.add_row(
                 Text(report.playlist_name),
                 str(sum(decision.candidate is not None for decision in report.decisions)),

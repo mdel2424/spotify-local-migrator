@@ -65,6 +65,7 @@ class MatchDecision(BaseModel):
 
 class MatchReport(BaseModel):
     schema_version: int = 1
+    operation: Literal["migrate", "cleanup"] = "migrate"
     phase: Literal["MATCH", "REVIEW", "PLAN"] = "MATCH"
     playlist_id: str
     playlist_name: str
@@ -80,3 +81,10 @@ class MatchReport(BaseModel):
     matching_complete: bool = False
     real_api_validation: bool = False
     validation_summary: dict[str, Any] = Field(default_factory=dict)
+
+    @model_serializer(mode="wrap")
+    def serialize(self, handler: SerializerFunctionWrapHandler) -> dict[str, Any]:
+        data = handler(self)
+        if self.operation == "migrate":
+            data.pop("operation", None)  # Preserve existing saved plan hashes.
+        return data

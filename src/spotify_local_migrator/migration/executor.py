@@ -87,6 +87,7 @@ def load_plan(store: JobStore) -> MigrationPlan:
         or rebuilt.account_id != plan.account_id
         or rebuilt.snapshot_id != plan.snapshot_id
         or rebuilt.playlist_id != plan.playlist_id
+        or rebuilt.operation != plan.operation
     ):
         raise StateError("Saved plan was altered; do not apply it.")
     return plan
@@ -104,10 +105,15 @@ def validate_journal(plan: MigrationPlan, journal: MigrationJournal) -> None:
         raise StateError("Migration progress is invalid.")
     expected = [entry.model_copy() for entry in plan.original]
     for replacement in plan.replacements[: journal.next_replacement]:
-        expected[replacement.position] = EntryIdentity(
-            uri=replacement.replacement_uri, is_local=False, item_type="track"
-        )
+        if plan.operation == "cleanup":
+            del expected[replacement.position]
+        else:
+            expected[replacement.position] = EntryIdentity(
+                uri=replacement.replacement_uri, is_local=False, item_type="track"
+            )
     if journal.stage == "added":
+        if plan.operation == "cleanup":
+            raise StateError("Cleanup cannot contain an insertion stage.")
         if journal.next_replacement >= len(plan.replacements):
             raise StateError("Invalid final migration stage.")
         replacement = plan.replacements[journal.next_replacement]
@@ -123,7 +129,9 @@ def validate_journal(plan: MigrationPlan, journal: MigrationJournal) -> None:
             raise StateError("Invalid pending operation.")
         replacement = plan.replacements[journal.next_replacement]
         after = [entry.model_copy() for entry in expected]
-        if pending.kind == "add" and journal.stage == "ready":
+        if pending.kind == "delete" and plan.operation == "cleanup" and journal.stage == "ready":
+            del after[replacement.position]
+        elif pending.kind == "add" and journal.stage == "ready" and plan.operation == "migrate":
             after.insert(
                 replacement.position,
                 EntryIdentity(uri=replacement.replacement_uri, is_local=False, item_type="track"),
@@ -572,7 +580,11 @@ class MigrationExecutor:
                                 "kind": pending.kind,
                                 "replacement_index": journal.next_replacement,
                                 "position": plan.replacements[journal.next_replacement].position
-                                + (1 if pending.kind == "delete" else 0),
+                                + (
+                                    1
+                                    if pending.kind == "delete" and plan.operation == "migrate"
+                                    else 0
+                                ),
                                 "snapshot_before": pending.snapshot_before,
                                 "snapshot_after": current.snapshot_id,
                                 "acknowledged_snapshot": pending.acknowledged_snapshot,
@@ -593,8 +605,10 @@ class MigrationExecutor:
                             journal.next_replacement += 1
                         save_journal(store, journal)
                         if pending.kind == "delete":
+                            label = "removal" if plan.operation == "cleanup" else "replacement"
                             self.progress(
-                                f"Verified replacement {journal.next_replacement}"
+                                f"Verified {label} "
+                                f"{journal.next_replacement}"
                                 f"/{len(plan.replacements)}"
                             )
                         continue
@@ -668,13 +682,29 @@ class MigrationExecutor:
                         raise StateError(
                             "Replacement is no longer available; local occurrence left unchanged."
                         )
-                    after.insert(
-                        replacement.position,
-                        EntryIdentity(
-                            uri=replacement.replacement_uri, is_local=False, item_type="track"
-                        ),
-                    )
-                    kind = "add"
+                    if plan.operation == "cleanup":
+                        target = after[replacement.position]
+                        if (
+                            not target.is_local
+                            or target.uri != replacement.local_uri
+                            or not any(
+                                not entry.is_local and entry.uri == replacement.replacement_uri
+                                for entry in after
+                            )
+                        ):
+                            raise StateError(
+                                "Local duplicate or retained Spotify track is missing."
+                            )
+                        del after[replacement.position]
+                        kind = "delete"
+                    else:
+                        after.insert(
+                            replacement.position,
+                            EntryIdentity(
+                                uri=replacement.replacement_uri, is_local=False, item_type="track"
+                            ),
+                        )
+                        kind = "add"
                 else:
                     local_position = replacement.position + 1
                     if (
@@ -712,7 +742,7 @@ class MigrationExecutor:
             else:
                 snapshot = self.client.remove_positions(
                     plan.playlist_id,
-                    [replacement.position + 1],
+                    [replacement.position + (1 if plan.operation == "migrate" else 0)],
                     pending.requested_snapshot or pending.snapshot_before,
                 )
         except SpotifyAPIError as exc:

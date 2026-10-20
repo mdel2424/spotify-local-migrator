@@ -1,4 +1,5 @@
 import json
+from datetime import timedelta
 
 import pytest
 
@@ -53,3 +54,57 @@ def test_failed_disk_write_is_actionable(settings, capture, monkeypatch):
     with pytest.raises(StateError, match="permissions") as error:
         CaptureStore(settings.data_dir).save(capture)
     assert "private system details" not in str(error.value)
+
+
+def test_saved_local_counts_use_latest_capture_time_and_include_zero(settings, capture):
+    from spotify_local_migrator.migration.jobs import JobStore
+
+    store = CaptureStore(settings.data_dir)
+    playlist_id = capture.playlist.playlist_id
+    store.save(capture)
+    latest = capture.model_copy(
+        update={"captured_at": capture.captured_at + timedelta(days=2), "entries": []}
+    )
+    store.save(latest)
+    # An older imported capture can be saved to a new job after the latest scan.
+    JobStore.create(settings.data_dir, capture)
+    assert store.local_counts([playlist_id]) == {playlist_id: "0"}
+    assert len(store.load(store.originals()[0]).local_tracks) == 1
+    newer_job_capture = capture.model_copy(
+        update={"captured_at": capture.captured_at + timedelta(days=3)}
+    )
+    JobStore.create(settings.data_dir, newer_job_capture)
+    assert store.local_counts([playlist_id]) == {playlist_id: "1"}
+
+
+@pytest.mark.parametrize(
+    "relative_path", ["original.json", "scans/scan/original.json", "jobs/job/original.json"]
+)
+def test_saved_local_counts_recognize_existing_captures(settings, capture, relative_path):
+    target = settings.data_dir / capture.playlist.playlist_id / relative_path
+    atomic_write_json(target, capture.model_dump(mode="json"))
+    assert CaptureStore(settings.data_dir).local_counts([capture.playlist.playlist_id]) == {
+        capture.playlist.playlist_id: "1"
+    }
+
+
+def test_saved_local_counts_ignore_missing_invalid_and_wrong_playlist_captures(settings, capture):
+    store = CaptureStore(settings.data_dir)
+    playlist_id = capture.playlist.playlist_id
+    assert store.local_counts([playlist_id, "../escape"]) == {}
+    assert not settings.data_dir.exists()
+    store.save(capture)
+    bad_path = settings.data_dir / playlist_id / "jobs" / "broken" / "original.json"
+    bad_path.parent.mkdir(parents=True)
+    bad_path.write_text("incomplete json")
+    wrong_capture = capture.model_copy(
+        update={
+            "captured_at": capture.captured_at + timedelta(days=1),
+            "playlist": capture.playlist.model_copy(update={"playlist_id": "B" * 22}),
+            "entries": [],
+        }
+    )
+    atomic_write_json(
+        bad_path.parent.parent / "wrong" / "original.json", wrong_capture.model_dump(mode="json")
+    )
+    assert store.local_counts([playlist_id, "B" * 22]) == {playlist_id: "1"}

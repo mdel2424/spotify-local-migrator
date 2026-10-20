@@ -6,6 +6,8 @@ A Python 3.12+ CLI that replaces local-file occurrences in Spotify playlists
 with matching Spotify catalogue tracks. It supports automatic matching, manual
 review, dry runs, and resumable migration while preserving track order,
 duplicates, and unmatched local files.
+It can also remove local copies when a web migration has already added their
+Spotify counterparts to the playlist.
 
 ## Implementation details
 
@@ -27,6 +29,14 @@ Equivalent album releases are grouped using recording identifiers, title,
 artists, and duration. Playable explicit versions take priority over clean
 counterparts; otherwise, Spotify's first matching search result is preferred.
 Manual choices remain saved.
+
+Cleanup compares local tracks only against Spotify tracks in the captured
+playlist, using the same artist hints and review rules. It pairs occurrences
+one for one, removes selected locals from bottom to top, and preserves every
+existing Spotify occurrence in order. Uncertain and unpaired locals remain.
+Each deletion uses the same compatibility check, journal and verification as
+migration. Missing availability information is checked only for plausible
+counterparts; matching and manual lookup do not search the Spotify catalogue.
 
 Migration works from the bottom of the playlist upward. It inserts a replacement
 before its local occurrence, verifies the complete sequence, removes the shifted
@@ -129,6 +139,21 @@ track unmatched. Local and Spotify metadata appear side by side, with difference
 highlighted and a duration delta. Other matches are available on demand;
 numbered choices remain available.
 
+If another app has left both local and Spotify copies, preview cleanup first:
+
+```bash
+spotify-local-migrate cleanup --dry-run
+spotify-local-migrate review --offline --job PATH_PRINTED_ABOVE
+spotify-local-migrate cleanup --job PATH_PRINTED_ABOVE
+```
+
+`cleanup` accepts `-p PLAYLIST_ID`, `--artist NAME`, and `--config PATH`.
+The preview writes no playlist changes and prints the exact job path to review
+and apply. Apply asks for confirmation. `--no-review` keeps uncertain pairs;
+`cleanup --latest` selects the most recent cleanup job. Interrupted cleanup
+continues with `resume --job PATH`. Use a fresh scan after changes made by other
+apps; existing migration jobs are not reused as cleanup jobs.
+
 To select another playlist directly:
 
 ```bash
@@ -138,6 +163,9 @@ spotify-local-migrate match -p PLAYLIST_ID
 
 `-p` accepts a 22-character playlist ID, Spotify playlist URI, or playlist URL.
 Playlist list numbers are only accepted at the interactive selection prompt.
+The playlist table shows local counts from the latest saved scan, including
+matching and cleanup jobs; playlists without a saved scan show `not scanned`.
+Use `playlists --count-local` to refresh and save these counts.
 
 `review`, `resume`, and `migrate --latest` use the most recently updated job.
 Use `--job PATH` to select a specific saved job:
@@ -161,6 +189,7 @@ For an uncertain write, inspect Spotify before using `--retry-unconfirmed`
 | `review --all` | Include automatic and unmatched decisions |
 | `review --offline` | Review saved candidates without API calls |
 | `migrate --no-review` | Leave ambiguous matches unchanged |
+| `cleanup --dry-run` | Preview removal of local copies already represented on Spotify |
 | `status` | Show saved jobs, login state, and request usage without API calls |
 | `--help` | Show commands and options; also available on each command |
 

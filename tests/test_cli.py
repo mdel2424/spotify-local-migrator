@@ -73,7 +73,17 @@ def cli_setup(settings, make_api, monkeypatch, raw_local, tmp_path):
 def test_help_lists_read_matching_review_and_migration_commands():
     result = runner.invoke(cli.app, ["--help"])
     assert result.exit_code == 0, result.output
-    for command in ("login", "playlists", "scan", "status", "match", "review", "migrate", "resume"):
+    for command in (
+        "login",
+        "playlists",
+        "scan",
+        "status",
+        "match",
+        "review",
+        "migrate",
+        "cleanup",
+        "resume",
+    ):
         assert command in result.output
 
 
@@ -109,14 +119,49 @@ def test_interactive_default_selects_playlist(cli_setup):
     assert any(request.url.path == "/v1/me/playlists" for request in calls)
 
 
-def test_local_counts_read_playlists_without_saving(cli_setup):
+def test_local_counts_save_scans_and_reuse_them_in_later_listings(cli_setup):
     options, calls, settings = cli_setup
     result = runner.invoke(cli.app, options + ["playlists", "--count-local"])
     assert result.exit_code == 0, result.output
     assert "Westside Gunn" in result.output
     assert len(calls) == 4
-    assert CaptureStore(settings.data_dir).originals() == []
+    saved = CaptureStore(settings.data_dir).originals()
+    assert len(saved) == 1
+    assert len(CaptureStore.load(saved[0]).local_tracks) == 1
+    calls.clear()
+    result = runner.invoke(cli.app, options + ["playlists"])
+    assert result.exit_code == 0, result.output
+    assert "not scanned" not in result.output
+    assert "latest saved scan" in result.output
+    assert len(calls) == 1
+    assert calls[0].url.path == "/v1/me/playlists"
+
+
+def test_playlist_listing_marks_only_playlists_without_saved_scans_unscanned(cli_setup):
+    options, calls, settings = cli_setup
+    result = runner.invoke(cli.app, options + ["playlists"])
+    assert result.exit_code == 0, result.output
+    assert "not scanned" in result.output
+    assert len(calls) == 1
     assert not (settings.data_dir / PLAYLIST_ID).exists()
+
+
+@pytest.mark.parametrize("source", ["scan", "job"])
+def test_interactive_picker_uses_saved_counts_without_rescanning(cli_setup, capture, source):
+    from spotify_local_migrator.migration.jobs import JobStore
+
+    options, calls, settings = cli_setup
+    if source == "scan":
+        CaptureStore(settings.data_dir).save(capture)
+    else:
+        JobStore.create(settings.data_dir, capture)
+    result = runner.invoke(cli.app, options, input="")
+    assert result.exit_code == 1  # Exit the picker without starting another scan.
+    assert "Select playlist" in result.output
+    assert "not scanned" not in result.output
+    assert "latest saved scan" in result.output
+    assert len(calls) == 1
+    assert calls[0].url.path == "/v1/me/playlists"
 
 
 def test_status_does_not_contact_spotify(cli_setup):

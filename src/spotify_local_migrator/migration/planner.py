@@ -4,7 +4,7 @@ from collections import Counter
 from datetime import UTC, datetime
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, SerializerFunctionWrapHandler, model_serializer
 
 from ..errors import StateError
 from ..matching.models import MatchReport
@@ -37,6 +37,7 @@ class PlannedRequest(BaseModel):
 
 class MigrationPlan(BaseModel):
     schema_version: int = 1
+    operation: Literal["migrate", "cleanup"] = "migrate"
     phase: Literal["PLAN"] = "PLAN"
     playlist_id: str
     playlist_name: str
@@ -60,6 +61,13 @@ class MigrationPlan(BaseModel):
             "snapshot_id": "<verified snapshot>",
         }
     )
+
+    @model_serializer(mode="wrap")
+    def serialize(self, handler: SerializerFunctionWrapHandler) -> dict:
+        data = handler(self)
+        if self.operation == "migrate":
+            data.pop("operation", None)
+        return data
 
 
 def identities(capture: PlaylistCapture) -> list[EntryIdentity]:
@@ -85,6 +93,9 @@ def build_plan(capture: PlaylistCapture, report: MatchReport) -> MigrationPlan:
     replacements = []
     original = identities(capture)
     desired = [entry.model_copy() for entry in original]
+    available = Counter(
+        entry.uri for entry in original if not entry.is_local and entry.item_type == "track"
+    )
     for decision in report.decisions:
         position = decision.local_track.playlist_position
         if position in seen or decision.local_track != local_by_position.get(position):
@@ -102,7 +113,12 @@ def build_plan(capture: PlaylistCapture, report: MatchReport) -> MigrationPlan:
         validate_playlist_id(candidate.spotify_id)
         if candidate.is_playable is not True:
             raise StateError("Replacement playability must be confirmed before planning.")
-        desired[position] = EntryIdentity(uri=candidate.uri, is_local=False, item_type="track")
+        if report.operation == "cleanup":
+            if available[candidate.uri] <= 0:
+                raise StateError("Cleanup match has no unused Spotify occurrence in this playlist.")
+            available[candidate.uri] -= 1
+        else:
+            desired[position] = EntryIdentity(uri=candidate.uri, is_local=False, item_type="track")
         replacements.append(
             Replacement(
                 position=position,
@@ -119,19 +135,36 @@ def build_plan(capture: PlaylistCapture, report: MatchReport) -> MigrationPlan:
     additions = Counter(item.replacement_uri for item in replacements)
     warnings = []
     for uri, count in additions.items():
-        if existing[uri] or count > 1:
+        if report.operation == "migrate" and (existing[uri] or count > 1):
             warnings.append(
                 f"{uri}: {existing[uri]} existing catalogue occurrence(s), "
                 f"{count} local occurrence(s) to replace; final count {existing[uri] + count}. "
                 "Each original occurrence is preserved."
             )
-    # Each pair leaves the playlist length unchanged. Starting at the end
-    # keeps lower original positions stable. Never DELETE by URI: duplicates
+    # Migration pairs leave length unchanged; cleanup removes locals. In both
+    # modes, starting at the end keeps lower original positions stable.
+    # Never DELETE by URI: duplicates
     # and other local occurrences must retain their positions/counts.
     replacements.sort(key=lambda item: item.position, reverse=True)
+    if report.operation == "cleanup":
+        for replacement in replacements:
+            del desired[replacement.position]
     endpoint = f"/playlists/{report.playlist_id}/items"
     requests = []
     for replacement in replacements:
+        if report.operation == "cleanup":
+            requests.append(
+                PlannedRequest(
+                    method="DELETE",
+                    endpoint=endpoint,
+                    body={
+                        "items": [],
+                        "positions": [replacement.position],
+                        "snapshot_id": "<verified current snapshot>",
+                    },
+                )
+            )
+            continue
         requests.extend(
             [
                 PlannedRequest(
@@ -154,6 +187,7 @@ def build_plan(capture: PlaylistCapture, report: MatchReport) -> MigrationPlan:
             ]
         )
     return MigrationPlan(
+        operation=report.operation,
         playlist_id=report.playlist_id,
         playlist_name=report.playlist_name,
         account_id=report.account_id,

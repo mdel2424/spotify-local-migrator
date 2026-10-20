@@ -90,7 +90,12 @@ def review_decision(
             console.print(
                 f"{more}. Show {len(candidates) - 1} other matches (choices 2–{len(candidates)})"
             )
-        console.print(f"{manual}. Search manually\n{leave}. Leave unchanged\n{debug}. Show scores")
+        manual_label = (
+            "Search existing playlist tracks"
+            if getattr(search, "scope", None) == "playlist"
+            else "Search manually"
+        )
+        console.print(f"{manual}. {manual_label}\n{leave}. Leave unchanged\n{debug}. Show scores")
         default = 1 if candidates else leave
         shortcut = (
             "Enter: accept top match; Esc: leave unchanged"
@@ -105,7 +110,12 @@ def review_decision(
                     "Select a saved result or leave unchanged."
                 )
                 continue
-            query = Prompt.ask("Spotify search query").strip()
+            query_label = (
+                "Existing playlist track or artist"
+                if getattr(search, "scope", None) == "playlist"
+                else "Spotify search query"
+            )
+            query = Prompt.ask(query_label).strip()
             if not query:
                 continue
             ranked_groups = rank_candidate_groups(
@@ -178,27 +188,60 @@ def review_report(
 ) -> MatchReport:
     if (store.directory / "migration.json").exists():
         raise StateError("Apply already started; decisions are locked. Use resume.")
-    if refresh_unreviewed_choices(report):
+    cleanup = report.operation == "cleanup"
+    if cleanup:
+        from ..matching.cleanup import PlaylistSearch, refresh_cleanup_choices, remaining_candidates
+
+        capture = store.capture()
+        search = PlaylistSearch(report, capture)
+        console.print("Cleanup review: accepting a pair selects its local copy for removal.")
+        changed = refresh_cleanup_choices(report, capture)
+    else:
+        changed = refresh_unreviewed_choices(report)
+    if changed:
         store.save("matches.json", report)
     config = MatchingConfig.model_validate(report.matching_config)
-    for decision in report.decisions:
+    for index in range(len(report.decisions)):
+        if cleanup:
+            refresh_cleanup_choices(report, capture)
+        decision = report.decisions[index]
         if all_tracks or decision.needs_review:
+            if cleanup:
+                search.position = decision.local_track.playlist_position
+                available = {
+                    candidate.uri
+                    for candidate in remaining_candidates(report, capture, search.position)
+                }
+                decision.candidates = [
+                    candidate for candidate in decision.candidates if candidate.uri in available
+                ]
             review_decision(console, decision, search, config)
+            if cleanup:
+                refresh_cleanup_choices(report, capture)
             report.phase = "REVIEW"
             store.save("matches.json", report)
     return report
 
 
 def show_plan(console: Console, plan: MigrationPlan) -> None:
-    console.print(Text(f"\nMigration plan: {plan.playlist_name}"))
+    cleanup = plan.operation == "cleanup"
+    console.print(Text(f"\n{'Cleanup' if cleanup else 'Migration'} plan: {plan.playlist_name}"))
     count = len(plan.replacements)
     console.print(
         f"Local occurrences: {plan.local_count}\n"
-        f"Replace: {count}\nLeave: {plan.local_count - count}\n"
-        f"Add Spotify: {count}\nDelete local: {count}"
+        f"{'Remove local copies' if cleanup else 'Replace'}: {count}\n"
+        f"Leave: {plan.local_count - count}\n"
+        f"Add Spotify: {0 if cleanup else count}\nDelete local: {count}"
     )
-    table = Table(title="Planned replacements (executed from bottom to top)")
-    for column in ("Position (1-based)", "Replacement", "Selection", "Score"):
+    table = Table(
+        title=f"Planned {'removals' if cleanup else 'replacements'} (executed from bottom to top)"
+    )
+    for column in (
+        "Local position (1-based)" if cleanup else "Position (1-based)",
+        "Spotify track retained" if cleanup else "Replacement",
+        "Selection",
+        "Score",
+    ):
         table.add_column(column)
     for replacement in plan.replacements:
         table.add_row(
@@ -208,6 +251,11 @@ def show_plan(console: Console, plan: MigrationPlan) -> None:
             f"{replacement.score:.0%}",
         )
     console.print(table)
+    if cleanup:
+        console.print(
+            "Existing Spotify tracks keep their order. "
+            "Each Spotify occurrence covers one local copy."
+        )
     for warning in plan.duplicate_warnings:
         console.print(Text(warning, style="yellow"))
     if count:

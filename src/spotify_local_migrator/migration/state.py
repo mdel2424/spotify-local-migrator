@@ -2,6 +2,8 @@ import json
 import os
 import re
 import tempfile
+from collections.abc import Iterable
+from datetime import UTC
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -69,6 +71,35 @@ class CaptureStore:
 
     def originals(self) -> list[Path]:
         return sorted(self.data_dir.glob("*/original.json"))
+
+    def local_counts(self, playlist_ids: Iterable[str]) -> dict[str, str]:
+        """Read the latest complete saved scan, including matching and cleanup jobs."""
+        counts: dict[str, str] = {}
+        for playlist_id in playlist_ids:
+            if not PLAYLIST_ID_PATTERN.fullmatch(playlist_id):
+                continue
+            directory = self.data_dir / playlist_id
+            latest_time: float | None = None
+            paths = (
+                directory / "original.json",
+                *directory.glob("scans/*/original.json"),
+                *directory.glob("jobs/*/original.json"),
+            )
+            for path in paths:
+                try:
+                    capture = self.load(path)
+                except StateError:
+                    continue
+                if capture.playlist.playlist_id != playlist_id:
+                    continue
+                captured_at = capture.captured_at
+                if captured_at.tzinfo is None:
+                    captured_at = captured_at.replace(tzinfo=UTC)
+                scan_time = captured_at.timestamp()
+                if latest_time is None or scan_time > latest_time:
+                    latest_time = scan_time
+                    counts[playlist_id] = str(len(capture.local_tracks))
+        return counts
 
     @staticmethod
     def load(target: Path) -> PlaylistCapture:

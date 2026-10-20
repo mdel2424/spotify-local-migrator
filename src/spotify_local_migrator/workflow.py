@@ -54,6 +54,8 @@ def match_job(
         store.save("matches.json", report)
     else:
         report = store.report()
+        if report.operation == "cleanup":
+            raise StateError("This is a cleanup job. Use cleanup --job, review or resume.")
         if report.account_id != account:
             raise StateError("This matching job belongs to another Spotify account.")
         if (store.directory / "migration.json").exists():
@@ -118,5 +120,83 @@ def match_job(
             )
 
         report = run_matching(store, report, search, progress, live_api=True)
+    show_results(console, report)
+    return store
+
+
+def cleanup_job(
+    settings: Settings,
+    client: SpotifyClient,
+    console: Console,
+    *,
+    store: JobStore | None = None,
+    playlist_id: str | None = None,
+    from_scan: Path | None = None,
+    config_path: Path = Path("config.yaml"),
+    expected_artists: list[str] | None = None,
+) -> JobStore:
+    from .matching.cleanup import cleanup_report, playlist_candidates, refresh_cleanup_choices
+    from .matching.scoring import review_evidence
+    from .matching.search import candidate_from_api
+
+    account = account_id(client)
+    if store is None:
+        capture = (
+            CaptureStore.load(from_scan)
+            if from_scan
+            else PlaylistScanner(client, attempts=settings.scan_attempts).scan(playlist_id)
+        )
+        store = JobStore.create(settings.data_dir, capture)
+        report = cleanup_report(
+            capture, load_matching_config(config_path), account, expected_artists
+        )
+    else:
+        report = store.report()
+        if report.operation != "cleanup" or report.account_id != account:
+            raise StateError("Select a cleanup job belonging to this Spotify account.")
+        capture = store.capture()
+        if expected_artists:
+            report.expected_artists = unique_names(expected_artists)
+            report.expected_artist_source = "configured"
+            enriched = {
+                candidate.uri: candidate
+                for decision in report.decisions
+                for candidate in decision.candidates
+            }
+            pool = [enriched.get(item.uri, item) for item in playlist_candidates(capture)]
+            for decision in report.decisions:
+                if not decision.review_completed and decision.status not in (
+                    "approved",
+                    "rejected",
+                ):
+                    decision.candidates = pool
+            refresh_cleanup_choices(report, capture, initial=True)
+    console.print(Text(f"Cleanup job: {store.directory}"))
+    with store.lock():
+        if (store.directory / "migration.json").exists():
+            raise StateError("Cleanup already started. Use resume for this job.")
+        store.save("matches.json", report)
+        config = MatchingConfig.model_validate(report.matching_config)
+        unchecked = {
+            candidate.uri: candidate
+            for decision in report.decisions
+            for candidate in decision.candidates
+            if candidate.is_playable is None
+            and review_evidence(decision.local_track, candidate, config)
+        }
+        for uri, candidate in unchecked.items():
+            checked = candidate_from_api(client.track(candidate.spotify_id))
+            if checked is None or checked.uri != uri:
+                checked = candidate.model_copy(update={"is_playable": False})
+            checked.search_order = candidate.search_order
+            for decision in report.decisions:
+                decision.candidates = [
+                    checked if item.uri == uri else item for item in decision.candidates
+                ]
+            refresh_cleanup_choices(report, capture, initial=True)
+            store.save("matches.json", report)
+        report.real_api_validation = True
+        refresh_cleanup_choices(report, capture, initial=True)
+        store.save("matches.json", report)
     show_results(console, report)
     return store
